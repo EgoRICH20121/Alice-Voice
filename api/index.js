@@ -711,7 +711,7 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens, signa
   if (!answer) {
     console.error(
       "Gemini empty response:",
-      model,
+      { requestId, model, durationMs: Date.now() - startedAt },
       JSON.stringify(
         result.data?.promptFeedback ||
         result.data?.candidates?.[0]?.finishReason ||
@@ -774,7 +774,8 @@ function isRetriable(error) {
     m === "GEMINI_TIMEOUT" ||
     m === "GEMINI_NETWORK_ERROR" ||
     m === "GEMINI_EMPTY_RESPONSE" ||
-    /^GEMINI_HTTP_5\d\d$/.test(m)
+    /^GEMINI_HTTP_5\d\d$/.test(m) ||
+    m === "GEMINI_HTTP_404"
   );
 }
 
@@ -1226,6 +1227,8 @@ function errorText(error) {
       return "У Gemini закончился доступный лимит запросов. Попробуй позже.";
     case "GEMINI_BAD_REQUEST":
       return "Gemini отклонила формат запроса. Ошибка записана в лог Vercel.";
+    case "GEMINI_HTTP_404":
+      return "Gemini не нашла указанную модель. Проверь GEMINI_MODEL в Vercel или укажи доступную модель; запасная модель тоже не ответила.";
     case "GEMINI_HTTP_503":
       return "Gemini сейчас перегружена и временно не отвечает. Попробуй ещё раз через несколько секунд.";
     case "GEMINI_TIMEOUT":
