@@ -668,3 +668,36 @@ test("general search result is summarised by Gemini only when search is requeste
     assert.match(payload.response.text, /90,5/);
   } finally { f.mock.restore(); }
 });
+
+
+test("global Alice deadline cancels the active downstream request", async () => {
+  let observedSignal;
+
+  const f = mockFetch((_url, opts) => {
+    observedSignal = opts.signal;
+
+    return new Promise((_, reject) => {
+      const fail = () => reject(observedSignal.reason || new Error("aborted"));
+      if (observedSignal.aborted) {
+        fail();
+        return;
+      }
+      observedSignal.addEventListener("abort", fail, { once: true });
+    });
+  });
+
+  const started = Date.now();
+
+  try {
+    const { payload } = await call(turn("Расскажи подробно про космос"));
+    const elapsed = Date.now() - started;
+
+    assert.match(payload.response.text, /не успела ответить вовремя/i);
+    assert.ok(elapsed < 3100, `took ${elapsed} ms`);
+    assert.ok(observedSignal, "fetch should receive an AbortSignal");
+    assert.equal(observedSignal.aborted, true, "deadline should abort the fetch");
+    assert.deepEqual(payload.session_state.history, []);
+  } finally {
+    f.mock.restore();
+  }
+});
