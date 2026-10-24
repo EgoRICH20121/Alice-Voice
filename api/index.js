@@ -1,8 +1,8 @@
 const MODEL = "gemini-3.5-flash-lite";
 
-const TOTAL_BUDGET_MS = 4100;
-const SERPER_TIMEOUT_MS = 1000;
-const GEMINI_TIMEOUT_MS = 2800;
+const TOTAL_BUDGET_MS = 4200;
+const SERPER_TIMEOUT_MS = 3000;
+const GEMINI_TIMEOUT_MS = 3700;
 
 const MAX_TEXT = 1024;
 const MAX_HISTORY = 12;
@@ -129,7 +129,9 @@ function getMemoryCommand(text) {
 
   if (remember) {
     const fact = cleanText(
-      remember[1].replace(/[.!?]+$/, ""),
+      remember[1]
+        .replace(/^[\s,.:;—-]+/, "")
+        .replace(/[.!?]+$/, ""),
       120
     );
 
@@ -223,10 +225,9 @@ function memoryCommandResult(command, memory) {
 
 function buildHistory(history, userText, answer) {
   const result = [...history];
-
-  // Не добавляем запрос повторно, если он уже есть в истории.
   const last = result[result.length - 1];
 
+  // Не добавляем запрос повторно, если он уже есть в истории.
   if (
     !last ||
     last.role !== "user" ||
@@ -402,7 +403,10 @@ async function searchWeb(query, timeoutMs) {
     );
 
     if (!response.ok) {
-      console.error("Serper HTTP status:", response.status);
+      console.error(
+        "Serper HTTP status:",
+        response.status
+      );
       return null;
     }
 
@@ -426,7 +430,9 @@ async function searchWeb(query, timeoutMs) {
       ? (Array.isArray(data.news) ? data.news : [])
       : (Array.isArray(data.organic) ? data.organic : []);
 
-    for (const item of organic.slice(0, newsSearch ? 6 : 5)) {
+    for (
+      const item of organic.slice(0, newsSearch ? 6 : 5)
+    ) {
       const title = cleanText(item?.title, 180);
       const snippet = cleanText(item?.snippet, 350);
       const date = cleanText(item?.date, 80);
@@ -521,9 +527,8 @@ async function askGemini(
   const normalizedContents = [];
 
   for (const item of contents) {
-    const previous = normalizedContents[
-      normalizedContents.length - 1
-    ];
+    const previous =
+      normalizedContents[normalizedContents.length - 1];
 
     if (previous?.role === item.role) {
       if (item.role === "user") {
@@ -627,7 +632,15 @@ function fallbackSearchAnswer(
   }
 
   const snippets = results
-    .map(item => item.snippet || item.title)
+    .map(item => {
+      const parts = [
+        item.title,
+        item.date,
+        item.snippet
+      ].filter(Boolean);
+
+      return parts.join(". ");
+    })
     .filter(Boolean);
 
   if (weather) {
@@ -733,42 +746,16 @@ export default async function handler(req, res) {
         Math.max(0, searchTimeout)
       );
 
-      let answer = null;
-
-      if (results?.length) {
-        const remaining = getRemainingTime(startTime);
-
-        // Поиск и краткая выжимка выполняются последовательно,
-        // но на Gemini выделяется только оставшееся время.
-        if (remaining > 500) {
-          answer = await askGemini(
-            userText,
-            history,
-            Math.min(
-              GEMINI_TIMEOUT_MS,
-              remaining - 250
-            ),
-            formatSearchResults(results),
-            userMemory
-          );
-        }
-
-        if (!answer) {
-          answer = fallbackSearchAnswer(
-            results,
-            weather,
-            news,
-            sports
-          );
-        }
-      } else {
-        answer = fallbackSearchAnswer(
-          null,
-          weather,
-          news,
-          sports
-        );
-      }
+      // Не запускаем Gemini вторым запросом после Serper:
+      // два внешних API подряд часто не укладываются
+      // в лимит Яндекс Диалогов (4,5 секунды).
+      // Формируем короткий ответ непосредственно по результатам поиска.
+      const answer = fallbackSearchAnswer(
+        results,
+        weather,
+        news,
+        sports
+      );
 
       return aliceResponse(
         res,
