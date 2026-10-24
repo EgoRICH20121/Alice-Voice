@@ -6,7 +6,7 @@ const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
 const TOTAL_RESPONSE_BUDGET_MS = 4200;
-const SERPER_TIMEOUT_MS = 300;
+const SERPER_TIMEOUT_MS = 1400;
 const GEMINI_TIMEOUT_MS = 3800;
 
 const SYSTEM_PROMPT = [
@@ -14,8 +14,9 @@ const SYSTEM_PROMPT = [
   "Отвечай естественно, по-русски, кратко и понятно.",
   "Обычно используй 1–3 коротких предложения.",
   "Не используй Markdown, таблицы и длинные вступления.",
-  "Для актуальных данных используй результаты поиска, если они переданы.",
-  "Не выдумывай факты. Если не знаешь ответа, честно скажи об этом."
+  "Для актуальных данных опирайся на результаты поиска, если они переданы.",
+  "Если актуальные данные не удалось проверить через поиск, честно сообщи об этом.",
+  "Не выдумывай новости, даты, цены и другие факты."
 ].join(" ");
 
 function aliceResponse(text, endSession = false, history = []) {
@@ -109,9 +110,11 @@ function isAbortError(error) {
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
 
-  if (!key || timeoutMs < 150) return "";
+  if (!key || timeoutMs < 200) return "";
 
   try {
+    console.log("Starting Serper search.");
+
     const { response, data } = await fetchJson(
       "https://google.serper.dev/search",
       {
@@ -127,7 +130,7 @@ async function searchWeb(query, timeoutMs) {
           num: 3
         })
       },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+      timeoutMs
     );
 
     if (!response.ok) {
@@ -140,7 +143,9 @@ async function searchWeb(query, timeoutMs) {
       .map((item, index) => {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
-        return `${index + 1}. ${title}: ${snippet}`;
+        const link = String(item.link || "").slice(0, 240);
+
+        return `${index + 1}. ${title}: ${snippet} ${link}`.trim();
       });
 
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
@@ -151,10 +156,11 @@ async function searchWeb(query, timeoutMs) {
       );
     }
 
+    console.log("Serper results received:", items.length);
     return items.join("\n");
   } catch (error) {
     console.warn(
-      "Serper unavailable:",
+      "Serper search failed:",
       isAbortError(error) ? "timeout" : String(error?.message || "unknown")
     );
     return "";
@@ -180,9 +186,17 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     parts: [{ text: item.text }]
   }));
 
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска:\n${searchContext}\nИспользуй только сведения, относящиеся к вопросу.`
-    : text;
+  let prompt = text;
+
+  if (searchContext) {
+    prompt +=
+      "\n\nАктуальные результаты интернет-поиска:\n" +
+      searchContext +
+      "\nОтветь на вопрос на основе этих результатов. Не добавляй неподтверждённые сведения.";
+  } else if (isSearchIntent(text)) {
+    prompt +=
+      "\n\nАктуальные результаты поиска не получены. Не утверждай, что проверил интернет, и не выдумывай свежие новости или данные.";
+  }
 
   contents.push({
     role: "user",
@@ -328,16 +342,17 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
 
-    // При нехватке времени пропускаем поиск и сразу обращаемся к Gemini.
     if (
       isSearchIntent(text) &&
       process.env.SERPER_API_KEY &&
-      remainingMs() > 3900
+      remainingMs() > 3000
     ) {
-      searchContext = await searchWeb(
-        text,
-        Math.min(SERPER_TIMEOUT_MS, remainingMs() - 3600)
+      const searchTimeout = Math.min(
+        SERPER_TIMEOUT_MS,
+        remainingMs() - 2600
       );
+
+      searchContext = await searchWeb(text, searchTimeout);
     }
 
     const geminiTimeout = Math.min(
