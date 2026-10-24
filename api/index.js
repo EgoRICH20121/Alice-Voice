@@ -1,8 +1,8 @@
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const MAX_ALICE_TEXT = 1024;
 const MAX_HISTORY = 8;
 const TOTAL_BUDGET_MS = 4100;
-const GEMINI_TIMEOUT_MS = 3500;
+const GEMINI_TIMEOUT_MS = 2700;
 const SERPER_TIMEOUT_MS = 2200;
 
 const SYSTEM_PROMPT = [
@@ -26,7 +26,11 @@ function clean(value, max = MAX_ALICE_TEXT) {
 
 function fitAliceText(value) {
   const text = clean(value, 5000);
-  if (!text) return "Не удалось подготовить ответ. Попробуйте ещё раз.";
+
+  if (!text) {
+    return "Не удалось подготовить ответ. Попробуйте ещё раз.";
+  }
+
   if (text.length <= MAX_ALICE_TEXT) return text;
 
   const cut = text.slice(0, MAX_ALICE_TEXT - 1);
@@ -41,7 +45,10 @@ function fitAliceText(value) {
   }
 
   const space = cut.lastIndexOf(" ");
-  return (space > 200 ? cut.slice(0, space) : cut).trim() + "…";
+
+  return (
+    space > 200 ? cut.slice(0, space) : cut
+  ).trim() + "…";
 }
 
 function safeHistory(value) {
@@ -59,7 +66,11 @@ function safeHistory(value) {
     const text = clean(item.text, 700);
     if (!text) continue;
 
-    const entry = { role: item.role, parts: [{ text }] };
+    const entry = {
+      role: item.role,
+      parts: [{ text }]
+    };
+
     const previous = result[result.length - 1];
 
     if (previous && previous.role === entry.role) {
@@ -96,6 +107,90 @@ function normalizeFact(s) {
     .trim();
 }
 
+// Отвечаем на вопросы о сохранённых фактах без обращения к Gemini.
+function answerFromMemoryQuestion(text, facts) {
+  const q = normalizeFact(text);
+  const queryWords = q.split(" ");
+
+  const isPersonalQuestion =
+    ["мой", "моя", "моё", "мое", "мои", "я", "мне"]
+      .some(w => queryWords.includes(w)) ||
+    q.includes("у меня") ||
+    q.includes("обо мне");
+
+  if (!facts.length || !isPersonalQuestion) return null;
+
+  const stopWords = new Set([
+    "какой", "какая", "какое", "какие",
+    "мой", "моя", "моё", "мое", "мои",
+    "у", "меня", "обо", "мне", "я",
+    "что", "как", "где", "когда", "ли",
+    "это", "есть", "был", "была", "были",
+    "быть", "называется", "про", "за"
+  ]);
+
+  const wanted = q
+    .split(" ")
+    .filter(w => w.length > 2 && !stopWords.has(w));
+
+  if (!wanted.length) return null;
+
+  const matchingFact = [...facts].reverse().find(fact => {
+    const normalized = normalizeFact(fact);
+    return wanted.every(word => normalized.includes(word));
+  });
+
+  if (!matchingFact) return null;
+
+  const colorMatch = normalizeFact(matchingFact)
+    .match(/любимый цвет\s+(.+)$/i);
+
+  if (/любим[а-яё]* цвет/i.test(q) && colorMatch) {
+    const color = colorMatch[1]
+      .trim()
+      .replace(/[.!?]+$/, "");
+
+    return `Твой любимый цвет — ${color}.`;
+  }
+
+  return `Ты говорила, что ${matchingFact.replace(/^[,\s]+/, "")}.`;
+}
+
+async function geminiWithRetry(
+  text,
+  history,
+  memory,
+  timeoutMs,
+  remainingMs
+) {
+  try {
+    return await gemini(text, history, memory, timeoutMs);
+  } catch (error) {
+    // Повторяем запрос один раз только при временной ошибке 503.
+    if (
+      error?.message !== "GEMINI_HTTP_503" ||
+      remainingMs() < 650
+    ) {
+      throw error;
+    }
+
+    const retryTimeout = Math.min(800, remainingMs() - 150);
+
+    if (retryTimeout < 300) throw error;
+
+    console.warn(
+      "Gemini returned HTTP 503; retrying once within time budget."
+    );
+
+    return await gemini(
+      text,
+      history,
+      memory,
+      retryTimeout
+    );
+  }
+}
+
 function parseMemoryCommand(text) {
   let m = text.match(
     /^(?:алиса[, ]*)?запомни(?: пожалуйста)?(?:\s*,?\s*(?:что\s*)?)?(.+)$/i
@@ -107,7 +202,10 @@ function parseMemoryCommand(text) {
       .replace(/[.!?]+$/, "");
 
     if (fact) {
-      return { type: "remember", fact: clean(fact, 120) };
+      return {
+        type: "remember",
+        fact: clean(fact, 120)
+      };
     }
   }
 
@@ -122,7 +220,10 @@ function parseMemoryCommand(text) {
     };
   }
 
-  if (/^(?:что ты помнишь|что ты обо мне помнишь|что запомнила)\??$/i.test(text.trim())) {
+  if (
+    /^(?:что ты помнишь|что ты обо мне помнишь|что запомнила)\??$/i
+      .test(text.trim())
+  ) {
     return { type: "list" };
   }
 
@@ -133,9 +234,13 @@ function fitFacts(facts) {
   const out = [];
 
   for (const f of facts.slice(-12)) {
-    const fact = clean(f, 120).replace(/^[\s,.:;—-]+/, "");
+    const fact = clean(f, 120)
+      .replace(/^[\s,.:;—-]+/, "");
 
-    if (!fact || out.some(x => normalizeFact(x) === normalizeFact(fact))) {
+    if (
+      !fact ||
+      out.some(x => normalizeFact(x) === normalizeFact(fact))
+    ) {
       continue;
     }
 
@@ -197,6 +302,7 @@ function memoryResponse(command, oldFacts) {
 
   const kept = facts.filter(f => {
     const n = normalizeFact(f);
+
     return !(
       n.includes(target) ||
       (words.length && words.every(w => n.includes(w)))
@@ -245,25 +351,38 @@ function buildHistory(history, userText, answer) {
 
   const last = h[h.length - 1];
 
-  if (!last || last.role !== "user" || last.text !== userText) {
-    h.push({ role: "user", text: clean(userText, 700) });
+  if (
+    !last ||
+    last.role !== "user" ||
+    last.text !== userText
+  ) {
+    h.push({
+      role: "user",
+      text: clean(userText, 700)
+    });
   }
 
-  h.push({ role: "model", text: clean(answer, 700) });
+  h.push({
+    role: "model",
+    text: clean(answer, 700)
+  });
 
   return h.slice(-MAX_HISTORY * 2);
 }
 
 function isWeather(text) {
-  return /погод\w*|температур\w*|сколько градусов|будет ли дождь|осадки/i.test(text);
+  return /погод\w*|температур\w*|сколько градусов|будет ли дождь|осадки/i
+    .test(text);
 }
 
 function isNews(text) {
-  return /новост\w*|что произошло|что случилось|события в мире/i.test(text);
+  return /новост\w*|что произошло|что случилось|события в мире/i
+    .test(text);
 }
 
 function isSports(text) {
-  return /кто выиграл|кто победил|результат\w* матч|сч[её]т матч|последн\w* матч|футбол.*(сегодня|вчера|сч[её]т|матч)|хокке.*(сегодня|вчера|сч[её]т|матч)/i.test(text);
+  return /кто выиграл|кто победил|результат\w* матч|сч[её]т матч|последн\w* матч|футбол.*(сегодня|вчера|сч[её]т|матч)|хокке.*(сегодня|вчера|сч[её]т|матч)/i
+    .test(text);
 }
 
 function isSearch(text) {
@@ -271,7 +390,8 @@ function isSearch(text) {
     isWeather(text) ||
     isNews(text) ||
     isSports(text) ||
-    /(найди|найти|поищи|в интернете|актуальн\w*|курс валют|цена сегодня|последняя информация)/i.test(text)
+    /(найди|найти|поищи|в интернете|актуальн\w*|курс валют|цена сегодня|последняя информация)/i
+      .test(text)
   );
 }
 
@@ -335,16 +455,31 @@ async function fetchJson(url, options, timeoutMs) {
 async function gemini(text, history, memory, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
 
-  if (!key) throw new Error("MISSING_GEMINI_API_KEY");
-  if (timeoutMs < 300) throw new Error("NO_TIME_LEFT");
+  if (!key) {
+    throw new Error("MISSING_GEMINI_API_KEY");
+  }
+
+  if (timeoutMs < 300) {
+    throw new Error("NO_TIME_LEFT");
+  }
 
   const contents = safeHistory(history);
   const last = contents[contents.length - 1];
 
-  if (!last || last.role !== "user" || last.parts[0].text !== text) {
-    const entry = { role: "user", parts: [{ text }] };
+  if (
+    !last ||
+    last.role !== "user" ||
+    last.parts[0].text !== text
+  ) {
+    const entry = {
+      role: "user",
+      parts: [{ text }]
+    };
 
-    if (contents.length && contents[contents.length - 1].role === "user") {
+    if (
+      contents.length &&
+      contents[contents.length - 1].role === "user"
+    ) {
       contents[contents.length - 1].parts[0].text += "\n" + text;
     } else {
       contents.push(entry);
@@ -353,7 +488,8 @@ async function gemini(text, history, memory, timeoutMs) {
 
   const prompt = SYSTEM_PROMPT + (
     memory.length
-      ? " Сохранённые факты пользователя: " + memory.join("; ") + "."
+      ? " Сохранённые факты пользователя: " +
+        memory.join("; ") + "."
       : ""
   );
 
@@ -382,7 +518,12 @@ async function gemini(text, history, memory, timeoutMs) {
       timeoutMs
     );
   } catch (e) {
-    console.error("Gemini fetch failed:", e?.name, e?.message);
+    console.error(
+      "Gemini fetch failed:",
+      e?.name,
+      e?.message
+    );
+
     throw new Error(
       e?.name === "AbortError"
         ? "GEMINI_TIMEOUT"
@@ -397,11 +538,17 @@ async function gemini(text, history, memory, timeoutMs) {
       JSON.stringify(result.data?.error || {}).slice(0, 600)
     );
 
-    if (result.r.status === 400) throw new Error("GEMINI_BAD_REQUEST");
+    if (result.r.status === 400) {
+      throw new Error("GEMINI_BAD_REQUEST");
+    }
+
     if (result.r.status === 401 || result.r.status === 403) {
       throw new Error("GEMINI_KEY_REJECTED");
     }
-    if (result.r.status === 429) throw new Error("GEMINI_QUOTA");
+
+    if (result.r.status === 429) {
+      throw new Error("GEMINI_QUOTA");
+    }
 
     throw new Error("GEMINI_HTTP_" + result.r.status);
   }
@@ -465,6 +612,7 @@ async function serper(query, timeoutMs) {
         r.status,
         JSON.stringify(data).slice(0, 400)
       );
+
       return null;
     }
 
@@ -495,7 +643,12 @@ async function serper(query, timeoutMs) {
 
     return results.length ? results : null;
   } catch (e) {
-    console.error("Serper fetch failed:", e?.name, e?.message);
+    console.error(
+      "Serper fetch failed:",
+      e?.name,
+      e?.message
+    );
+
     return null;
   }
 }
@@ -530,7 +683,10 @@ function localReply(text) {
     .trim()
     .replace(/[!.?]+$/, "");
 
-  if (/^(привет|приветик|здравствуй|здравствуйте|доброе утро|добрый день|добрый вечер|хай|салют|алиса привет)$/i.test(t)) {
+  if (
+    /^(привет|приветик|здравствуй|здравствуйте|доброе утро|добрый день|добрый вечер|хай|салют|алиса привет)$/i
+      .test(t)
+  ) {
     return "Привет! Рада тебя слышать. Что хочешь узнать?";
   }
 
@@ -542,7 +698,10 @@ function localReply(text) {
     return "Пожалуйста!";
   }
 
-  if (/^(расскажи анекдот|анекдот|расскажи шутку|пошути|скажи шутку)$/i.test(t)) {
+  if (
+    /^(расскажи анекдот|анекдот|расскажи шутку|пошути|скажи шутку)$/i
+      .test(t)
+  ) {
     const jokes = [
       "Программист звонит в библиотеку: «У вас есть книги про паранойю?» Библиотекарь шёпотом отвечает: «Они прямо за вами».",
       "Покупатель спрашивает: «У вас есть компьютер, который никогда не зависает?» Продавец: «Есть. Но он уже три дня не отвечает».",
@@ -573,6 +732,9 @@ function errorText(error) {
     case "GEMINI_BAD_REQUEST":
       return "Gemini отклонила формат запроса. Ошибка записана в лог Vercel.";
 
+    case "GEMINI_HTTP_503":
+      return "Gemini сейчас перегружена и временно не отвечает. Попробуй ещё раз через несколько секунд.";
+
     case "GEMINI_TIMEOUT":
     case "NO_TIME_LEFT":
       return "Нейросеть не успела ответить за отведённое время. Попробуй ещё раз.";
@@ -599,7 +761,9 @@ export default async function handler(req, res) {
 
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ error: "Method not allowed" });
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
   }
 
   const started = Date.now();
@@ -629,9 +793,16 @@ export default async function handler(req, res) {
     : [];
 
   const history = oldHistory
-    .filter(x => x && ["user", "model"].includes(x.role) && typeof x.text === "string")
+    .filter(
+      x => x &&
+        ["user", "model"].includes(x.role) &&
+        typeof x.text === "string"
+    )
     .slice(-MAX_HISTORY * 2)
-    .map(x => ({ role: x.role, text: clean(x.text, 700) }));
+    .map(x => ({
+      role: x.role,
+      text: clean(x.text, 700)
+    }));
 
   const memory = getMemory(body);
 
@@ -670,6 +841,16 @@ export default async function handler(req, res) {
     );
   }
 
+  const memoryAnswer = answerFromMemoryQuestion(text, memory);
+
+  if (memoryAnswer) {
+    return response(
+      res,
+      memoryAnswer,
+      buildHistory(history, text, memoryAnswer)
+    );
+  }
+
   try {
     if (isSearch(text)) {
       const query = searchQuery(text);
@@ -700,11 +881,17 @@ export default async function handler(req, res) {
       );
     }
 
-    const answer = await gemini(
+    const firstAttemptTimeout = Math.min(
+      GEMINI_TIMEOUT_MS,
+      remaining() - 1000
+    );
+
+    const answer = await geminiWithRetry(
       text,
       history,
       memory,
-      Math.min(GEMINI_TIMEOUT_MS, remaining() - 250)
+      firstAttemptTimeout,
+      remaining
     );
 
     return response(
@@ -713,7 +900,10 @@ export default async function handler(req, res) {
       buildHistory(history, text, answer)
     );
   } catch (error) {
-    console.error("Alice handler error:", error?.message || error);
+    console.error(
+      "Alice handler error:",
+      error?.message || error
+    );
 
     const message = errorText(error);
 
@@ -725,4 +915,11 @@ export default async function handler(req, res) {
   }
 }
 
-export { clean, safeHistory, parseMemoryCommand, localReply, isSearch };
+export {
+  clean,
+  safeHistory,
+  parseMemoryCommand,
+  localReply,
+  answerFromMemoryQuestion,
+  isSearch
+};
