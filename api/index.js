@@ -849,8 +849,14 @@ async function serper(query, kind, timeoutMs, signal, requestId) {
         requestTimeoutMs, signal
       );
     } catch (e) {
-      console.error("Serper fetch failed:", { requestId, stage, durationMs: Date.now() - requestStartedAt, errorName: e?.name, errorMessage: e?.message });
-      return { error: true, results: null };
+      const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError" ||
+        /timed out|timeout/i.test(String(e?.message || ""));
+      console.error("Serper fetch failed:", {
+        requestId, stage, durationMs: Date.now() - requestStartedAt,
+        errorType: timedOut ? "timeout" : "network",
+        errorName: e?.name, errorMessage: e?.message
+      });
+      return { error: true, errorType: timedOut ? "timeout" : "network", results: null };
     }
     const { r, data } = response;
     if (!r.ok) {
@@ -883,12 +889,30 @@ async function serper(query, kind, timeoutMs, signal, requestId) {
     const result = await request(null, timeoutMs, "search");
     return result.results;
   }
-  const first = await request("qdr:d", Math.min(1200, timeoutMs), "news_day");
+  let first = await request("qdr:d", Math.min(1100, timeoutMs), "news_day");
+  // Если Serper завис именно по тайм-ауту, допускаем ровно одну короткую
+  // повторную попытку в рамках общего бюджета поиска новостей.
+  if (first.error && first.errorType === "timeout") {
+    const remainingAfterTimeout = timeoutMs - (Date.now() - startedAt);
+    const retryTimeoutMs = Math.min(700, remainingAfterTimeout - 200);
+    if (retryTimeoutMs >= 300) {
+      console.warn("Serper news retry:", {
+        requestId, reason: "timeout", remainingMs: remainingAfterTimeout
+      });
+      first = await request("qdr:d", retryTimeoutMs, "news_day_retry");
+    } else {
+      console.log("Serper news retry skipped:", {
+        requestId, reason: "insufficient_time",
+        remainingMs: Math.max(0, remainingAfterTimeout)
+      });
+      return null;
+    }
+  }
   if (first.error || first.invalidShape || !first.results) return null;
   if (first.results.length) return first.results;
   const elapsedMs = Date.now() - startedAt;
   const remainingMs = timeoutMs - elapsedMs;
-  const fallbackTimeoutMs = Math.min(1000, remainingMs - 200);
+  const fallbackTimeoutMs = Math.min(800, remainingMs - 200);
   if (fallbackTimeoutMs < 300) {
     console.log("Serper news fallback skipped:", { requestId, reason: "insufficient_time", remainingMs: Math.max(0, remainingMs) });
     return first.results;
