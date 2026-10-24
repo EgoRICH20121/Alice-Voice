@@ -613,6 +613,55 @@ test("6c. if Gemini is down the news fall back to headlines with snippets and da
   } finally { f.mock.restore(); }
 });
 
+test("6d. empty daily news trigger a bounded weekly fallback and label the period", async () => {
+  const r = router({
+    serper: async body => body.tbs === "qdr:d" ? json({ news: [] }) : json({ news: [{ title: "Новый стандарт памяти", date: "3 дня назад", snippet: "Производители представили новый стандарт оперативной памяти.", source: "Техно" }] }),
+    gemini: async () => geminiOk("За последнюю неделю появился новый стандарт оперативной памяти.")
+  });
+  const f = mockFetch(r.impl);
+  try {
+    const { payload } = await call(turn("последние новости про озу"));
+    assert.deepEqual(r.log.filter(x => x.api === "serper").map(x => x.body.tbs), ["qdr:d", "qdr:w"]);
+    assert.equal(r.log.filter(x => x.api === "gemini").length, 1);
+    const prompt = r.log.find(x => x.api === "gemini").body.contents[0].parts[0].text;
+    assert.match(prompt, /за последнюю неделю, а не только за сутки/i);
+    assert.match(payload.response.text, /последнюю неделю/i);
+  } finally { f.mock.restore(); }
+});
+
+test("6e. no daily or weekly news returns an honest empty result", async () => {
+  const r = router({ serper: async () => json({ news: [] }) });
+  const f = mockFetch(r.impl);
+  try {
+    const { payload } = await call(turn("последние новости про озу"));
+    assert.deepEqual(r.log.map(x => x.body.tbs), ["qdr:d", "qdr:w"]);
+    assert.match(payload.response.text, /за последнюю неделю новостей.*не нашла/i);
+    assert.equal(r.log.length, 2);
+  } finally { f.mock.restore(); }
+});
+
+test("6f. unexpected Serper response shape is not mistaken for an empty news list", async () => {
+  const r = router({ serper: async () => json({ items: [] }) });
+  const f = mockFetch(r.impl);
+  try {
+    const { payload } = await call(turn("последние новости про озу"));
+    assert.match(payload.response.text, /Поиск сейчас недоступен/);
+    assert.equal(r.log.length, 1);
+  } finally { f.mock.restore(); }
+});
+
+test("6g. Serper authorization, rate-limit and server errors do not trigger weekly fallback", async () => {
+  for (const status of [401, 429, 500]) {
+    const r = router({ serper: async () => json({ error: "upstream failure" }, status) });
+    const f = mockFetch(r.impl);
+    try {
+      const { payload } = await call(turn("последние новости про озу"));
+      assert.match(payload.response.text, /Поиск сейчас недоступен/);
+      assert.equal(r.log.length, 1, `status ${status} should not retry`);
+    } finally { f.mock.restore(); }
+  }
+});
+
 /* ---------------- 12. недоступность Serper ---------------- */
 
 test("12a. Serper network failure gives an honest 'search unavailable' message", async () => {
@@ -639,7 +688,7 @@ test("12b. Serper HTTP error and empty results are distinguished", async () => {
   try {
     const { payload } = await call(turn("последние новости про космос"));
     assert.match(payload.response.text, /не нашла/);
-    assert.equal(r2.log.length, 1); // без результатов Gemini не вызывается
+    assert.equal(r2.log.length, 2); // дневной поиск и резервный поиск за неделю; Gemini не вызывается
   } finally { f.mock.restore(); }
 });
 

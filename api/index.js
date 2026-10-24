@@ -23,6 +23,7 @@ const GEMINI_FIRST_TIMEOUT_MS = 2000;
 const GEMINI_DETAILED_TIMEOUT_MS = 2500;
 const GEMINI_RETRY_TIMEOUT_MS = 1500;
 const SERPER_TIMEOUT_MS = 1400;
+const NEWS_SEARCH_TIMEOUT_MS = 2200;
 const SUMMARY_FIRST_TIMEOUT_MS = 1700;
 const SUMMARY_RETRY_TIMEOUT_MS = 1200;
 const MIN_ATTEMPT_MS = 600;
@@ -831,99 +832,72 @@ function askGemini(text, history, memory, remaining, mode = "short", signal, req
 async function serper(query, kind, timeoutMs, signal, requestId) {
   const startedAt = Date.now();
   const key = process.env.SERPER_API_KEY;
-
   if (!key) {
     console.error("Serper unavailable:", { requestId, reason: "missing_api_key" });
     return null;
   }
-
   if (timeoutMs < 300) return null;
-
-  try {
-    const news = kind === "news";
-
-    const { r, data } = await fetchJson(
-      `https://google.serper.dev/${news ? "news" : "search"}`,
-      {
-        method: "POST",
-        headers: { "X-API-KEY": key, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          q: query,
-          gl: "ru",
-          hl: "ru",
-          num: 6,
-          ...(news ? { tbs: "qdr:d" } : {})
-        })
-      },
-      timeoutMs,
-      signal
-    );
-
+  const news = kind === "news";
+  async function request(period, requestTimeoutMs, stage) {
+    const requestStartedAt = Date.now();
+    let response;
+    try {
+      response = await fetchJson(
+        `https://google.serper.dev/${news ? "news" : "search"}`,
+        { method: "POST", headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+          body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 6, ...(news ? { tbs: period } : {}) }) },
+        requestTimeoutMs, signal
+      );
+    } catch (e) {
+      console.error("Serper fetch failed:", { requestId, stage, durationMs: Date.now() - requestStartedAt, errorName: e?.name, errorMessage: e?.message });
+      return { error: true, results: null };
+    }
+    const { r, data } = response;
     if (!r.ok) {
-      console.error("Serper HTTP error:", {
-        requestId,
-        status: r.status,
-        durationMs: Date.now() - startedAt,
-        error: JSON.stringify(data).slice(0, 400)
-      });
-      return null;
+      console.error("Serper HTTP error:", { requestId, stage, status: r.status, durationMs: Date.now() - requestStartedAt, error: JSON.stringify(data).slice(0, 300) });
+      return { error: true, results: null };
     }
-
-    const arr = news ? data.news : data.organic;
-
-    const results = (Array.isArray(arr) ? arr : [])
-      .slice(0, 6)
-      .map(x => ({
-        title: clean(x.title, 160),
-        date: clean(x.date, 60),
-        snippet: clean(x.snippet, 300),
-        source: clean(x.source, 60)
-      }))
-      .filter(x => x.title || x.snippet);
-
+    const arr = news ? data?.news : data?.organic;
+    const topLevelKeys = data && typeof data === "object" ? Object.keys(data).slice(0, 12) : [];
+    if (!Array.isArray(arr)) {
+      console.warn("Serper unexpected response shape:", { requestId, stage, status: r.status, durationMs: Date.now() - requestStartedAt, topLevelKeys, expectedArray: news ? "news" : "organic" });
+      return { invalidShape: true, results: null };
+    }
+    const sampleItemKeys = arr[0] && typeof arr[0] === "object" ? Object.keys(arr[0]).slice(0, 12) : [];
+    const results = arr.slice(0, 6).filter(x => x && typeof x === "object").map(x => ({
+      title: clean(x.title, 160), date: clean(x.date, 60), snippet: clean(x.snippet, 300), source: clean(x.source, 60)
+    })).filter(x => x.title || x.snippet);
+    console.log("Serper response:", { requestId, stage, status: r.status, durationMs: Date.now() - requestStartedAt, topLevelKeys, rawResultCount: arr.length, normalizedResultCount: results.length, sampleItemKeys });
     const box = data.answerBox;
-
-    if (box && typeof box === "object") {
+    if (!news && box && typeof box === "object") {
       const parts = [box.answer, box.snippet].filter(Boolean);
-
-      // Температуру из блока берём только в градусах Цельсия.
       const t = String(box.temperature ?? "").match(/-?\d{1,2}(?:[.,]\d)?/);
-      if (t && !/F/i.test(String(box.unit || ""))) {
-        parts.push(`${t[0]}°C`);
-      }
-
+      if (t && !/F/i.test(String(box.unit || ""))) parts.push(`${t[0]}°C`);
       if (box.weather) parts.push(box.weather);
-
-      if (parts.length) {
-        results.unshift({
-          title: "Ответ",
-          date: clean(box.date, 60),
-          snippet: clean(parts.join(", "), 300),
-          source: "",
-          box: true,
-          place: clean(box.location, 80)
-        });
-      }
+      if (parts.length) results.unshift({ title: "Ответ", date: clean(box.date, 60), snippet: clean(parts.join(", "), 300), source: "", box: true, place: clean(box.location, 80) });
     }
-
-    console.log("Serper success:", {
-      requestId,
-      status: r.status,
-      durationMs: Date.now() - startedAt,
-      resultCount: results.length
-    });
-    return results;
-  } catch (e) {
-    console.error("Serper fetch failed:", {
-      requestId,
-      durationMs: Date.now() - startedAt,
-      errorName: e?.name,
-      errorMessage: e?.message
-    });
-    return null;
+    results.searchPeriod = news ? (stage === "news_week" ? "week" : "day") : null;
+    return { results, rawResultCount: arr.length };
   }
+  if (!news) {
+    const result = await request(null, timeoutMs, "search");
+    return result.results;
+  }
+  const first = await request("qdr:d", Math.min(1200, timeoutMs), "news_day");
+  if (first.error || first.invalidShape || !first.results) return null;
+  if (first.results.length) return first.results;
+  const elapsedMs = Date.now() - startedAt;
+  const remainingMs = timeoutMs - elapsedMs;
+  const fallbackTimeoutMs = Math.min(1000, remainingMs - 200);
+  if (fallbackTimeoutMs < 300) {
+    console.log("Serper news fallback skipped:", { requestId, reason: "insufficient_time", remainingMs: Math.max(0, remainingMs) });
+    return first.results;
+  }
+  console.log("Serper news fallback:", { requestId, from: "qdr:d", to: "qdr:w", reason: "no_usable_day_results" });
+  const fallback = await request("qdr:w", fallbackTimeoutMs, "news_week");
+  if (fallback.error || fallback.invalidShape || !fallback.results) return null;
+  return fallback.results;
 }
-
 /* ------------------------------ погода ------------------------------ */
 
 const TEMP_RE = /([+\-−–]?\d{1,2}(?:[.,]\d)?)\s?(?:°|градус)/iu;
@@ -1084,7 +1058,9 @@ function buildSearchAnswer(kind, results, ctx = {}) {
 
   if (!list.length) {
     if (kind === "news") {
-      return "Свежих новостей за последние сутки не нашла. Попробуй уточнить тему.";
+      return results?.searchPeriod === "week"
+        ? "За последнюю неделю новостей по этой теме не нашла. Попробуй уточнить тему."
+        : "Свежих новостей за последние сутки не нашла. Попробуй уточнить тему.";
     }
     if (kind === "sports") {
       return "Не нашла подтверждённый результат матча. Уточните команды или турнир.";
@@ -1100,7 +1076,7 @@ function buildSearchAnswer(kind, results, ctx = {}) {
     });
 
     return fitAliceText(
-      `Главное по данным поиска за последние сутки. ${lines.join(" ")} Это только заголовки и краткие фрагменты, не полный текст статей.`
+      `Главное по данным поиска ${results?.searchPeriod === "week" ? "за последнюю неделю" : "за последние сутки"}. ${lines.join(" ")} Это только заголовки и краткие фрагменты, не полный текст статей.`
     );
   }
 
@@ -1150,6 +1126,9 @@ async function summarizeSearch(kind, results, userText, remaining, signal, reque
     .join("\n");
 
   const prompt = SUMMARY_PROMPTS[kind === "news" ? "news" : "general"];
+  const periodInstruction = kind === "news" && results.searchPeriod === "week"
+    ? "ВАЖНО: результаты собраны за последнюю неделю, а не только за сутки. Не называй их новостями за последние 24 часа; ориентируйся на даты в источниках. "
+    : "";
 
   try {
     const answer = await tryModels(
@@ -1161,7 +1140,7 @@ async function summarizeSearch(kind, results, userText, remaining, signal, reque
         system: prompt,
         contents: [{
           role: "user",
-          parts: [{ text: `Вопрос пользователя: ${userText}\n\nРезультаты поиска:\n${sources}` }]
+          parts: [{ text: `${periodInstruction}Вопрос пользователя: ${userText}\n\nРезультаты поиска:\n${sources}` }]
         }],
         timeoutMs,
         maxTokens: MAX_TOKENS_DETAILED,
@@ -1338,7 +1317,7 @@ async function processTurn(body, history, remaining, signal, requestId) {
     const results = await serper(
       query,
       kind,
-      Math.min(SERPER_TIMEOUT_MS, remaining() - SAFETY_MS),
+      Math.min(kind === "news" ? NEWS_SEARCH_TIMEOUT_MS : SERPER_TIMEOUT_MS, remaining() - SAFETY_MS),
       signal,
       requestId
     );
