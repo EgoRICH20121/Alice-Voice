@@ -1,96 +1,152 @@
 
 const MODEL = "gemini-3.5-flash-lite";
-const GEMINI_TIMEOUT_MS = 2200;
-const SERPER_TIMEOUT_MS = 1100;
+
+const TOTAL_BUDGET_MS = 3900;
+const GEMINI_TIMEOUT_MS = 3400;
+const SERPER_TIMEOUT_MS = 1200;
+
 const MAX_TEXT = 1024;
 const MAX_HISTORY = 12;
 
 const SYSTEM_INSTRUCTION = `
-Ты — голосовой собеседник Алисы. Говори естественно,
-дружелюбно и на русском языке.
-Отвечай кратко, как для умной колонки.
-На простые вопросы отвечай одним-двумя предложениями.
-Если пользователь просит подробности, объясняй подробнее.
-Учитывай историю разговора.
-Не выдумывай факты и предпочтения пользователя.
-Не используй Markdown без необходимости.
+Ты — голосовой собеседник Алисы. Отвечай на русском языке
+естественно, дружелюбно и кратко, как умная колонка.
+
+Правила:
+- На простые вопросы отвечай обычно одним-двумя предложениями.
+- Не повторяй вопрос пользователя.
+- Не добавляй вступления и предложения помощи без необходимости.
+- Учитывай историю разговора.
+- Не выдумывай факты, даты, цены, погоду и личную информацию.
+- Если не знаешь ответа, честно скажи об этом.
+- Если просят подробности, отвечай подробнее.
+- Не используй Markdown, таблицы и списки без необходимости.
+`.trim();
+
+const SEARCH_SYSTEM_INSTRUCTION = `
+Ты — редактор ответов голосового помощника Алисы.
+Твоя задача — составить короткий, связный и полезный ответ
+на основе предоставленных результатов интернет-поиска.
+
+Правила:
+- Отвечай по-русски, естественно, как для умной колонки.
+- Не перечисляй подряд заголовки сайтов.
+- Объединяй совпадающую информацию и выделяй главное.
+- Новости: сообщи, что произошло, суть события и дату,
+  только если дата подтверждается результатами.
+- Погода: отвечай только для запрошенного населённого пункта.
+  Назови температуру и прогноз, только если они есть в источниках.
+  Не подменяй населённый пункт соседним городом или регионом.
+- Не придумывай температуру, даты, события и цифры.
+- Если источники противоречат друг другу или данных мало,
+  прямо обозначь это.
+- Не называй информацию последней, если результаты этого не подтверждают.
+- Обычно отвечай в 1–3 коротких предложениях.
+- Не добавляй ненужных вступлений, ссылок и предложений помощи.
 `.trim();
 
 function cleanText(value, max = MAX_TEXT) {
   return String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, max)
-    .trim();
-}
-
-function cleanSnippet(value, max = 300) {
-  return String(value ?? "")
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
-    .replace(/\.{2,}|[…]+/g, ".")
     .trim()
-    .slice(0, max)
-    .trim();
+    .slice(0, max);
 }
 
-function getHistory(body) {
-  const history =
-    body?.state?.session?.history ??
-    body?.session_state?.history ??
-    [];
+function getRemainingTime(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
 
-  if (!Array.isArray(history)) return [];
+function getHistory(body, currentText = "") {
+  const candidates = [
+    body?.state?.session?.history,
+    body?.session_state?.history
+  ];
 
-  return history
+  let history = candidates.find(Array.isArray) || [];
+
+  history = history
     .filter(item =>
       item &&
       (item.role === "user" || item.role === "model") &&
       typeof item.text === "string"
     )
-    .slice(-MAX_HISTORY)
     .map(item => ({
       role: item.role,
-      text: cleanText(item.text, 800)
-    }));
+      text: cleanText(item.text, 700)
+    }))
+    .filter(item => item.text);
+
+  // Не добавляем текущее сообщение повторно,
+  // если платформа уже включила его в историю.
+  if (
+    history.length &&
+    history[history.length - 1].role === "user" &&
+    history[history.length - 1].text === currentText
+  ) {
+    history.pop();
+  }
+
+  // Объединяем подряд идущие сообщения одной роли.
+  const normalized = [];
+
+  for (const item of history) {
+    const last = normalized[normalized.length - 1];
+
+    if (last && last.role === item.role) {
+      last.text = cleanText(`${last.text}. ${item.text}`, 1000);
+    } else {
+      normalized.push({ ...item });
+    }
+  }
+
+  return normalized.slice(-MAX_HISTORY);
 }
 
-function getSearchEnabled(body) {
-  return (
-    body?.state?.session?.search_enabled ??
-    body?.session_state?.search_enabled ??
-    true
-  ) !== false;
-}
+function aliceResponse(res, text, history = []) {
+  const safeText =
+    cleanText(text) ||
+    "Не удалось подготовить ответ. Попробуйте ещё раз.";
 
-function aliceResponse(res, text, history = [], searchEnabled = true) {
   return res.status(200).json({
     version: "1.0",
     response: {
-      text: cleanText(text) ||
-        "Не удалось подготовить ответ. Попробуйте ещё раз.",
+      text: safeText,
       end_session: false
     },
     session_state: {
-      history: history.slice(-MAX_HISTORY),
-      search_enabled: searchEnabled
+      history: history.slice(-MAX_HISTORY)
     }
   });
 }
 
-function isSearchIntent(text) {
-  return /(найди|найти|поищи|поиск|последн\w* новост|новост\w*|свеж\w*|актуальн\w*|что случил\w*|сегодняшн\w*|курс валют|погод\w*|прогноз погоды|в интернете)/i
+function isWeatherIntent(text) {
+  return /\b(погод\w*|температур\w*|осадк\w*|дожд\w*|снег\w*|ветер\w*|прогноз погоды)\b/i
     .test(text);
 }
 
-function isWeatherIntent(text) {
-  return /(погод\w*|температур\w*|прогноз погоды)/i.test(text);
+function isNewsIntent(text) {
+  return /\b(новост\w*|последн\w*|свеж\w*|сегодняшн\w*|что случил\w*|что произошло|последние события|нового в)\b/i
+    .test(text);
+}
+
+function isExplicitSearchIntent(text) {
+  return /\b(найди|найти|поищи|поиск|в интернете|проверь в интернете|посмотри в интернете)\b/i
+    .test(text);
+}
+
+function isSearchIntent(text) {
+  return (
+    isWeatherIntent(text) ||
+    isNewsIntent(text) ||
+    isExplicitSearchIntent(text)
+  );
 }
 
 function extractSearchQuery(text) {
   return cleanText(
     text.replace(
-      /^(?:алиса[, ]*)?(?:найди|найти|поищи|поиск|расскажи|покажи|скажи)\s*/i,
+      /^(?:алиса[\s,]*)?(?:найди|найти|поищи|поиск|посмотри|проверь|расскажи|скажи|покажи)\s*/i,
       ""
     ),
     180
@@ -99,7 +155,10 @@ function extractSearchQuery(text) {
 
 async function fetchJsonWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(
+    () => controller.abort(),
+    Math.max(100, timeoutMs)
+  );
 
   try {
     const response = await fetch(url, {
@@ -122,7 +181,7 @@ async function fetchJsonWithTimeout(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query) {
+async function searchWeb(query, deadline) {
   const apiKey = process.env.SERPER_API_KEY;
 
   if (!apiKey) {
@@ -130,91 +189,95 @@ async function searchWeb(query) {
     return null;
   }
 
-  const { response, data } = await fetchJsonWithTimeout(
-    "https://google.serper.dev/search",
-    {
-      method: "POST",
-      headers: {
-        "X-API-KEY": apiKey,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        q: query,
-        gl: "ru",
-        hl: "ru",
-        num: 5
-      })
-    },
-    SERPER_TIMEOUT_MS
+  // Оставляем время для краткого пересказа и ответа Алисе.
+  const remaining = getRemainingTime(deadline);
+  const timeout = Math.min(
+    SERPER_TIMEOUT_MS,
+    remaining - 1800
   );
 
-  if (!response.ok) {
-    console.error("Serper HTTP status:", response.status);
+  if (timeout < 300) {
+    console.error("Not enough time to start web search");
     return null;
   }
 
-  const results = [];
-  const seen = new Set();
+  try {
+    const { response, data } = await fetchJsonWithTimeout(
+      "https://google.serper.dev/search",
+      {
+        method: "POST",
+        headers: {
+          "X-API-KEY": apiKey,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          q: query,
+          gl: "ru",
+          hl: "ru",
+          num: 5
+        })
+      },
+      timeout
+    );
 
-  const box = data.answerBox;
-  if (box?.answer || box?.snippet) {
-    const text = cleanSnippet(box.answer || box.snippet, 350);
-    if (text) results.push({ title: "Краткий ответ", snippet: text });
+    if (!response.ok) {
+      console.error("Serper HTTP status:", response.status);
+      return null;
+    }
+
+    const results = [];
+
+    if (data.answerBox?.answer) {
+      results.push({
+        title: "Краткий ответ",
+        snippet: cleanText(data.answerBox.answer, 350)
+      });
+    } else if (data.answerBox?.snippet) {
+      results.push({
+        title: "Краткий ответ",
+        snippet: cleanText(data.answerBox.snippet, 350)
+      });
+    }
+
+    const organic = Array.isArray(data.organic)
+      ? data.organic
+      : [];
+
+    for (const item of organic.slice(0, 5)) {
+      const title = cleanText(item?.title, 150);
+      const snippet = cleanText(item?.snippet, 300);
+
+      if (!title && !snippet) continue;
+
+      results.push({
+        title,
+        snippet
+      });
+    }
+
+    return results.length ? results : null;
+  } catch (error) {
+    console.error(
+      "Search error:",
+      error?.name || "Error",
+      cleanText(error?.message, 180)
+    );
+
+    return null;
   }
-
-  const organic = Array.isArray(data.organic) ? data.organic : [];
-
-  for (const item of organic) {
-    const title = cleanSnippet(item?.title, 160);
-    const snippet = cleanSnippet(item?.snippet, 300);
-    const key = (title + snippet).toLowerCase();
-
-    if ((!title && !snippet) || seen.has(key)) continue;
-    seen.add(key);
-
-    results.push({
-      title,
-      snippet,
-      source: cleanText(item?.source || "", 100),
-      date: cleanText(item?.date || "", 50)
-    });
-
-    if (results.length >= 4) break;
-  }
-
-  return results.length ? results : null;
 }
 
-async function summarizeSearch(userText, results, weather) {
+async function callGemini(contents, systemInstruction, timeoutMs) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
 
-  const sourceText = results.map((item, i) =>
-    `${i + 1}. ${item.title || "Материал"}`
-    + `${item.date ? `; дата: ${item.date}` : ""}`
-    + `${item.source ? `; источник: ${item.source}` : ""}`
-    + `\n${item.snippet || ""}`
-  ).join("\n\n").slice(0, 1800);
+  if (!apiKey) {
+    console.error("GEMINI_API_KEY is missing");
+    return { answer: null, reason: "missing_key" };
+  }
 
-  const instruction = weather
-    ? `Ты голосовой помощник. Кратко ответь на вопрос о погоде.
-Используй только предоставленные результаты.
-Ориентируйся на конкретный населённый пункт из запроса.
-Скажи температуру и краткий прогноз, если они есть в источниках.
-Не подменяй населённый пункт соседним городом или регионом.
-Если текущая температура не найдена, не выдумывай её.
-Обычно достаточно одного-двух предложений.
-Не читай названия страниц и не перечисляй поисковые результаты.`
-    : `Ты голосовой помощник, который готовит краткие сводки новостей.
-Ответь на запрос пользователя, опираясь только на источники ниже.
-Выдели главное и объясни, что произошло, без обрывков и повторов.
-Для новостей используй две-три короткие фразы.
-Если даты источников указаны, учитывай их при выборе свежих новостей.
-Не выдавай старые материалы за сегодняшние.
-Не выдумывай факты, даты, цифры и причинно-следственные связи.
-Если результатов недостаточно, честно скажи об этом.
-Не перечисляй заголовки подряд и не читай текст страниц дословно.
-Ответ предназначен для озвучивания колонкой.`;
+  if (timeoutMs < 300) {
+    return { answer: null, reason: "insufficient_time" };
+  }
 
   try {
     const { response, data } = await fetchJsonWithTimeout(
@@ -227,16 +290,11 @@ async function summarizeSearch(userText, results, weather) {
         },
         body: JSON.stringify({
           systemInstruction: {
-            parts: [{ text: instruction }]
+            parts: [{ text: systemInstruction }]
           },
-          contents: [{
-            role: "user",
-            parts: [{
-              text: `Вопрос пользователя: ${userText}\n\nРезультаты поиска:\n${sourceText}`
-            }]
-          }],
+          contents,
           generationConfig: {
-            temperature: 0.2,
+            temperature: 0.4,
             maxOutputTokens: 120,
             thinkingConfig: {
               thinkingLevel: "MINIMAL"
@@ -244,36 +302,55 @@ async function summarizeSearch(userText, results, weather) {
           }
         })
       },
-      GEMINI_TIMEOUT_MS
+      timeoutMs
     );
 
     if (!response.ok) {
-      console.error("Search summary Gemini status:", response.status);
-      return null;
+      console.error(
+        "Gemini HTTP status:",
+        response.status,
+        cleanText(data?.error?.message, 200)
+      );
+
+      return {
+        answer: null,
+        reason: `http_${response.status}`
+      };
     }
 
-    const answer = data?.candidates?.[0]?.content?.parts
-      ?.map(part => part.text || "")
-      .join("")
-      .trim();
+    const parts = data?.candidates?.[0]?.content?.parts;
+    const answer = Array.isArray(parts)
+      ? parts.map(part => part.text || "").join("").trim()
+      : "";
 
-    return answer ? cleanText(answer, MAX_TEXT) : null;
+    if (!answer) {
+      console.error(
+        "Gemini returned no text:",
+        data?.candidates?.[0]?.finishReason || "unknown"
+      );
+
+      return { answer: null, reason: "empty_answer" };
+    }
+
+    return {
+      answer: cleanText(answer),
+      reason: null
+    };
   } catch (error) {
     console.error(
-      "Search summary error:",
-      error?.name || "Error"
+      "Gemini request error:",
+      error?.name || "Error",
+      cleanText(error?.message, 180)
     );
-    return null;
+
+    return {
+      answer: null,
+      reason: error?.name === "AbortError" ? "timeout" : "network_error"
+    };
   }
 }
 
-async function askGemini(userText, history) {
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey) {
-    return "Нейросеть пока не настроена. Проверьте ключ Gemini в Vercel.";
-  }
-
+async function askGemini(userText, history, deadline) {
   const contents = [
     ...history.map(item => ({
       role: item.role,
@@ -285,61 +362,105 @@ async function askGemini(userText, history) {
     }
   ].slice(-8);
 
-  try {
-    const { response, data } = await fetchJsonWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: SYSTEM_INSTRUCTION }]
-          },
-          contents,
-          generationConfig: {
-            temperature: 0.6,
-            maxOutputTokens: 100,
-            thinkingConfig: {
-              thinkingLevel: "MINIMAL"
-            }
-          }
-        })
-      },
-      GEMINI_TIMEOUT_MS
-    );
+  const timeout = Math.min(
+    GEMINI_TIMEOUT_MS,
+    getRemainingTime(deadline) - 350
+  );
 
-    if (!response.ok) {
-      console.error("Gemini HTTP status:", response.status);
+  const result = await callGemini(
+    contents,
+    SYSTEM_INSTRUCTION,
+    timeout
+  );
 
-      if (response.status === 429) {
-        return "Слишком много запросов к нейросети. Попробуйте позже.";
-      }
+  if (result.answer) return result.answer;
 
-      return "Нейросеть временно недоступна. Попробуйте ещё раз.";
-    }
-
-    const answer = data?.candidates?.[0]?.content?.parts
-      ?.map(part => part.text || "")
-      .join("")
-      .trim();
-
-    return answer
-      ? cleanText(answer)
-      : "Не удалось получить ответ. Попробуйте ещё раз.";
-  } catch (error) {
-    console.error("Gemini request error:", error?.name || "Error");
-
-    return error?.name === "AbortError"
-      ? "Запрос занял слишком много времени. Попробуйте ещё раз."
-      : "Нейросеть временно недоступна. Попробуйте ещё раз.";
+  if (result.reason === "http_429") {
+    return "Сейчас слишком много запросов. Попробуйте немного позже.";
   }
+
+  return "Нейросеть сейчас не успела ответить. Попробуйте ещё раз.";
+}
+
+function fallbackSearchAnswer(results, weather) {
+  if (!results?.length) {
+    return "Сейчас не удалось получить данные из интернета. Попробуйте немного позже.";
+  }
+
+  const useful = results
+    .filter(item => item.snippet)
+    .slice(0, 2)
+    .map(item => item.snippet);
+
+  if (!useful.length) {
+    return "Поиск не нашёл достаточно информации для ответа.";
+  }
+
+  // Запасной ответ, если Gemini не успел сделать выжимку.
+  // Это лучше, чем выдавать длинный список заголовков.
+  const answer = cleanText(useful.join(". "), 650);
+
+  return weather
+    ? `По найденному прогнозу: ${answer}`
+    : `Кратко по найденным материалам: ${answer}`;
+}
+
+async function summarizeSearch(query, results, history, deadline, weather) {
+  const searchContext = results
+    .map((item, index) =>
+      `${index + 1}. ${item.title}\n${item.snippet}`
+    )
+    .join("\n\n")
+    .slice(0, 3200);
+
+  const prompt = `
+Запрос пользователя: ${query}
+
+${weather
+  ? "Это запрос о погоде. Укажи только данные для запрошенного населённого пункта. Если населённый пункт не указан или температура не найдена, не придумывай их."
+  : "Составь короткую выжимку по найденным материалам. Не выдавай список заголовков вместо ответа."}
+
+Результаты поиска:
+${searchContext}
+
+Сформулируй итоговый ответ для голосового помощника.
+`.trim();
+
+  // Для поиска берём только несколько последних сообщений:
+  // контекст не должен вытеснять свежие результаты.
+  const recentHistory = history.slice(-4);
+
+  const contents = [
+    ...recentHistory.map(item => ({
+      role: item.role,
+      parts: [{ text: item.text }]
+    })),
+    {
+      role: "user",
+      parts: [{ text: prompt }]
+    }
+  ].slice(-6);
+
+  const timeout = Math.min(
+    2500,
+    getRemainingTime(deadline) - 350
+  );
+
+  const result = await callGemini(
+    contents,
+    SEARCH_SYSTEM_INSTRUCTION,
+    timeout
+  );
+
+  return result.answer || fallbackSearchAnswer(results, weather);
 }
 
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
+
+  // Общий бюджет меньше лимита Яндекса:
+  // часть времени нужна на передачу ответа платформе.
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
 
   if (req.method !== "POST") {
     return aliceResponse(
@@ -358,106 +479,82 @@ export default async function handler(req, res) {
     }
   }
 
-  if (!body || typeof body !== "object") body = {};
+  if (!body || typeof body !== "object") {
+    body = {};
+  }
 
   const request = body.request || {};
   const userText = cleanText(
     request.original_utterance || request.command || ""
   );
-  const history = getHistory(body);
-  let searchEnabled = getSearchEnabled(body);
+
+  const history = getHistory(body, userText);
 
   if (!userText) {
     return aliceResponse(
       res,
       "Не расслышала вопрос. Повторите, пожалуйста.",
-      history,
-      searchEnabled
+      history
     );
   }
 
   const updatedHistory = [
     ...history,
     { role: "user", text: userText }
-  ];
-
-  if (/^(?:алиса[, ]*)?(?:выключи|отключи)\s+(?:умный\s+)?поиск[.! ]*$/i.test(userText)) {
-    searchEnabled = false;
-    const answer = "Поиск выключен. Буду отвечать без поиска в интернете.";
-
-    return aliceResponse(res, answer, [
-      ...updatedHistory,
-      { role: "model", text: answer }
-    ], searchEnabled);
-  }
-
-  if (/^(?:алиса[, ]*)?(?:включи|активируй)\s+(?:умный\s+)?поиск[.! ]*$/i.test(userText)) {
-    searchEnabled = true;
-    const answer = "Поиск включён.";
-
-    return aliceResponse(res, answer, [
-      ...updatedHistory,
-      { role: "model", text: answer }
-    ], searchEnabled);
-  }
+  ].slice(-MAX_HISTORY);
 
   try {
-    if (searchEnabled && isSearchIntent(userText)) {
-      const weather = isWeatherIntent(userText);
+    if (isSearchIntent(userText)) {
       const query = extractSearchQuery(userText);
+      const weather = isWeatherIntent(userText);
 
-      console.log("Search request:", query, "weather:", weather);
+      console.log("Search request:", query);
 
-      const results = await searchWeb(query);
+      const results = await searchWeb(query, deadline);
 
       if (!results) {
-        const answer = "Не получилось получить данные из интернета. Попробуйте позже.";
+        const message = weather
+          ? "Не удалось получить прогноз погоды. Попробуйте ещё раз позже."
+          : "Сейчас не удалось найти информацию в интернете. Попробуйте ещё раз позже.";
 
-        return aliceResponse(res, answer, [
-          ...updatedHistory,
-          { role: "model", text: answer }
-        ], searchEnabled);
+        return aliceResponse(res, message, updatedHistory);
       }
 
-      const summary = await summarizeSearch(userText, results, weather);
-
-      const fallback = cleanText(
-        results.map(item =>
-          [item.title, item.snippet].filter(Boolean).join(". ")
-        ).join(". "),
-        MAX_TEXT
-      );
-
-      const answer = summary || (
-        fallback
-          ? `Не удалось подготовить краткую сводку. Вот найденные данные: ${fallback}`
-          : "Не удалось подготовить ответ по результатам поиска."
+      const answer = await summarizeSearch(
+        query,
+        results,
+        history,
+        deadline,
+        weather
       );
 
       return aliceResponse(res, answer, [
         ...updatedHistory,
         { role: "model", text: answer }
-      ], searchEnabled);
+      ].slice(-MAX_HISTORY));
     }
 
-    const answer = await askGemini(userText, history);
+    const answer = await askGemini(
+      userText,
+      history,
+      deadline
+    );
 
     return aliceResponse(res, answer, [
       ...updatedHistory,
       { role: "model", text: answer }
-    ], searchEnabled);
+    ].slice(-MAX_HISTORY));
   } catch (error) {
     console.error(
       "Webhook error:",
       error?.name || "Error",
-      cleanText(error?.message || "Unknown error", 200)
+      cleanText(error?.message || "Unknown error", 180)
     );
 
-    const answer = "Произошла временная ошибка. Попробуйте ещё раз.";
-
-    return aliceResponse(res, answer, [
-      ...updatedHistory,
-      { role: "model", text: answer }
-    ], searchEnabled);
+    return aliceResponse(
+      res,
+      "Произошла временная ошибка. Попробуйте ещё раз.",
+      updatedHistory
+    );
   }
 }
