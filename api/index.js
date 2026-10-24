@@ -3,7 +3,7 @@ const MODEL = "gemini-3.5-flash-lite";
 const GEMINI_TIMEOUT_MS = 3800;
 const SERPER_TIMEOUT_MS = 1800;
 const MAX_TEXT = 1024;
-const MAX_HISTORY = 6;
+const MAX_HISTORY = 12;
 
 const SYSTEM_INSTRUCTION = `
 Ты — голосовой собеседник Алисы. Общайся естественно,
