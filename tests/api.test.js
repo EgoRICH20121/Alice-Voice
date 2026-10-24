@@ -688,7 +688,7 @@ test("12b. Serper HTTP error and empty results are distinguished", async () => {
   try {
     const { payload } = await call(turn("последние новости про космос"));
     assert.match(payload.response.text, /не нашла/);
-    assert.equal(r2.log.length, 1); // без результатов Gemini не вызывается
+    assert.equal(r2.log.length, 2); // дневной поиск и резервный поиск за неделю; Gemini не вызывается
   } finally { f.mock.restore(); }
 });
 
