@@ -7,7 +7,7 @@ const MAX_ALICE_TEXT = 1024;
 
 const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 1400;
-const GEMINI_TIMEOUT_MS = 3800;
+const GEMINI_TIMEOUT_MS = 1800;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -165,6 +165,32 @@ async function searchWeb(query, timeoutMs) {
     );
     return "";
   }
+}
+
+function makeSearchFallback(searchContext) {
+  const lines = String(searchContext || "")
+    .split("\n")
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line =>
+      line
+        .replace(/^\d+\.\s*/, "")
+        .replace(/https?:\/\/\S+/gi, "")
+        .replace(/\s{2,}/g, " ")
+        .trim()
+    )
+    .filter(Boolean)
+    .slice(0, 2);
+
+  if (!lines.length) {
+    return "Я нашла результаты поиска, но не успела подготовить краткий ответ. Попробуй спросить ещё раз.";
+  }
+
+  return fitAliceText(
+    "Нашла в интернете. " +
+    lines.join(" Второй результат: ") +
+    " Подробности можно уточнить дополнительным вопросом."
+  );
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
@@ -360,12 +386,27 @@ export default async function handler(req, res) {
       remainingMs() - 150
     );
 
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      geminiTimeout
-    );
+    let answer;
+
+    try {
+      answer = await askGemini(
+        text,
+        oldHistory,
+        searchContext,
+        geminiTimeout
+      );
+    } catch (geminiError) {
+      if (searchContext) {
+        console.warn(
+          "Gemini failed after successful search; using Serper fallback:",
+          geminiError?.message || "unknown error"
+        );
+
+        answer = makeSearchFallback(searchContext);
+      } else {
+        throw geminiError;
+      }
+    }
 
     const history = [
       ...oldHistory,
