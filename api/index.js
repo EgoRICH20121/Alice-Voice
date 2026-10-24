@@ -636,7 +636,8 @@ async function fetchJson(url, options, timeoutMs, parentSignal) {
 }
 
 // Низкоуровневый вызов Gemini. Ключ передаётся только в заголовке и не логируется.
-async function callGemini({ model, system, contents, timeoutMs, maxTokens, signal }) {
+async function callGemini({ model, system, contents, timeoutMs, maxTokens, signal, requestId }) {
+  const startedAt = Date.now();
   const key = process.env.GEMINI_API_KEY;
 
   if (!key) throw new Error("MISSING_GEMINI_API_KEY");
@@ -665,7 +666,13 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens, signa
       signal
     );
   } catch (e) {
-    console.error("Gemini fetch failed:", model, e?.name, e?.message);
+    console.error("Gemini fetch failed:", {
+      requestId,
+      model,
+      durationMs: Date.now() - startedAt,
+      errorName: e?.name,
+      errorMessage: e?.message
+    });
 
     throw new Error(
       (e?.name === "AbortError" || e?.name === "TimeoutError" || e?.message === "Request timed out")
@@ -679,9 +686,13 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens, signa
 
     console.error(
       "Gemini HTTP error:",
-      model,
-      status,
-      JSON.stringify(result.data?.error || {}).slice(0, 600)
+      {
+        requestId,
+        model,
+        status,
+        durationMs: Date.now() - startedAt,
+        error: JSON.stringify(result.data?.error || {}).slice(0, 600)
+      }
     );
 
     if (status === 400) throw new Error("GEMINI_BAD_REQUEST");
@@ -711,6 +722,11 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens, signa
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
 
+  console.log("Gemini success:", {
+    requestId,
+    model,
+    durationMs: Date.now() - startedAt
+  });
   return clean(answer);
 }
 
@@ -723,7 +739,7 @@ function buildSystemPrompt(memory, mode) {
   );
 }
 
-async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "short", signal) {
+async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "short", signal, requestId) {
   const contents = safeHistory(history);
   const last = contents[contents.length - 1];
 
@@ -745,7 +761,8 @@ async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "s
     contents: sliced,
     timeoutMs,
     maxTokens: mode === "detailed" ? MAX_TOKENS_DETAILED : MAX_TOKENS_SHORT,
-    signal
+    signal,
+    requestId
   });
 }
 
@@ -796,23 +813,24 @@ async function tryModels(remaining, firstCap, retryCap, run) {
   throw lastError || new Error("NO_TIME_LEFT");
 }
 
-function askGemini(text, history, memory, remaining, mode = "short", signal) {
+function askGemini(text, history, memory, remaining, mode = "short", signal, requestId) {
   return tryModels(
     remaining,
     mode === "detailed" ? GEMINI_DETAILED_TIMEOUT_MS : GEMINI_FIRST_TIMEOUT_MS,
     GEMINI_RETRY_TIMEOUT_MS,
-    (model, timeoutMs) => gemini(text, history, memory, timeoutMs, model, mode, signal)
+    (model, timeoutMs) => gemini(text, history, memory, timeoutMs, model, mode, signal, requestId)
   );
 }
 
 /* ------------------------------ поиск ------------------------------ */
 
 // null — поиск недоступен или завершился ошибкой; [] — ничего не найдено.
-async function serper(query, kind, timeoutMs, signal) {
+async function serper(query, kind, timeoutMs, signal, requestId) {
+  const startedAt = Date.now();
   const key = process.env.SERPER_API_KEY;
 
   if (!key) {
-    console.error("SERPER_API_KEY is missing");
+    console.error("Serper unavailable:", { requestId, reason: "missing_api_key" });
     return null;
   }
 
@@ -839,7 +857,12 @@ async function serper(query, kind, timeoutMs, signal) {
     );
 
     if (!r.ok) {
-      console.error("Serper HTTP error:", r.status, JSON.stringify(data).slice(0, 400));
+      console.error("Serper HTTP error:", {
+        requestId,
+        status: r.status,
+        durationMs: Date.now() - startedAt,
+        error: JSON.stringify(data).slice(0, 400)
+      });
       return null;
     }
 
@@ -880,9 +903,20 @@ async function serper(query, kind, timeoutMs, signal) {
       }
     }
 
+    console.log("Serper success:", {
+      requestId,
+      status: r.status,
+      durationMs: Date.now() - startedAt,
+      resultCount: results.length
+    });
     return results;
   } catch (e) {
-    console.error("Serper fetch failed:", e?.name, e?.message);
+    console.error("Serper fetch failed:", {
+      requestId,
+      durationMs: Date.now() - startedAt,
+      errorName: e?.name,
+      errorMessage: e?.message
+    });
     return null;
   }
 }
@@ -1102,7 +1136,7 @@ function numbersGrounded(answer, sources) {
 // Пересказ результатов поиска через Gemini. Возвращает null, если времени
 // мало, модель не ответила или в тексте появились числа, которых нет в
 // источниках — тогда используется детерминированный ответ.
-async function summarizeSearch(kind, results, userText, remaining, signal) {
+async function summarizeSearch(kind, results, userText, remaining, signal, requestId) {
   const list = uniqueResults(results).slice(0, 5);
   if (!list.length || remaining() - SAFETY_MS < MIN_ATTEMPT_MS + 100) return null;
 
@@ -1128,7 +1162,8 @@ async function summarizeSearch(kind, results, userText, remaining, signal) {
         }],
         timeoutMs,
         maxTokens: MAX_TOKENS_DETAILED,
-        signal
+        signal,
+        requestId
       })
     );
 
@@ -1209,7 +1244,7 @@ function errorText(error) {
 
 // Возвращает { text, history, userStateUpdate?, sessionExtra? }.
 // Ошибки Gemini пробрасываются наружу: в историю они не попадают.
-async function processTurn(body, history, remaining, signal) {
+async function processTurn(body, history, remaining, signal, requestId) {
   const text = clean(
     body?.request?.original_utterance || body?.request?.command || "",
     500
@@ -1299,13 +1334,14 @@ async function processTurn(body, history, remaining, signal) {
       query,
       kind,
       Math.min(SERPER_TIMEOUT_MS, remaining() - SAFETY_MS),
-      signal
+      signal,
+      requestId
     );
 
     let answer = null;
 
     if (kind !== "weather" && results?.length) {
-      answer = await summarizeSearch(kind, results, text, remaining, signal);
+      answer = await summarizeSearch(kind, results, text, remaining, signal, requestId);
     }
 
     answer = answer || buildSearchAnswer(kind, results, ctx);
@@ -1346,7 +1382,7 @@ async function processTurn(body, history, remaining, signal) {
       : `Ответь коротко на вопрос: ${lastUser}`;
   }
 
-  const answer = await askGemini(question, history, memory, remaining, mode, signal);
+  const answer = await askGemini(question, history, memory, remaining, mode, signal, requestId);
 
   return {
     text: answer,
@@ -1370,7 +1406,10 @@ export default async function handler(req, res) {
   }
 
   const started = Date.now();
+  const requestId = globalThis.crypto?.randomUUID?.() ||
+    `${started.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const remaining = () => TOTAL_BUDGET_MS - (Date.now() - started);
+  console.log("Alice request started:", { requestId, method: req.method });
 
   let body = req.body;
 
@@ -1395,6 +1434,11 @@ export default async function handler(req, res) {
     timer = setTimeout(
       () => {
         deadlineReached = true;
+        console.warn("Alice deadline reached:", {
+          requestId,
+          durationMs: Date.now() - started,
+          remainingMs: remaining()
+        });
         requestController.abort(new DOMException("Alice response deadline exceeded", "TimeoutError"));
         resolve({
           text: "Не успела ответить вовремя. Повтори вопрос, пожалуйста.",
@@ -1410,16 +1454,28 @@ export default async function handler(req, res) {
 
   try {
     result = await Promise.race([
-      processTurn(body, history, remaining, requestController.signal),
+      processTurn(body, history, remaining, requestController.signal, requestId),
       deadline
     ]);
   } catch (error) {
-    console.error("Alice handler error:", error?.message || error);
+    console.error("Alice handler error:", {
+      requestId,
+      durationMs: Date.now() - started,
+      error: error?.message || String(error)
+    });
     result = { text: errorText(error), history };
   } finally {
     clearTimeout(timer);
     if (deadlineReached) requestController.abort();
   }
+
+  console.log("Alice request completed:", {
+    requestId,
+    durationMs: Date.now() - started,
+    timedOut: deadlineReached,
+    responseLength: String(result.text || "").length,
+    historyEntries: Array.isArray(result.history) ? result.history.length : 0
+  });
 
   return response(
     res,
