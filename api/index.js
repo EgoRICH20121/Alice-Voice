@@ -1,7 +1,7 @@
 
 const MODEL = "gemini-3.5-flash-lite";
-const GEMINI_TIMEOUT_MS = 4600;
-const SERPER_TIMEOUT_MS = 2800;
+const GEMINI_TIMEOUT_MS = 3800;
+const SERPER_TIMEOUT_MS = 1800;
 const MAX_TEXT = 1024;
 const MAX_HISTORY = 6;
 
