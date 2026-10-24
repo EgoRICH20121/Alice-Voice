@@ -452,7 +452,7 @@ test("11. hanging Gemini still yields a reply well inside the Yandex 4.5 s limit
     const { payload } = await call(turn("Расскажи про космос подробнее"));
     const elapsed = Date.now() - t0;
     assert.ok(elapsed < 3600, `took ${elapsed} ms`);
-    assert.match(payload.response.text, /не успела|не успела ответить|отведённое время/);
+    assert.match(payload.response.text, /не успела|не успела ответить|отведённое время/i);
     assert.equal(payload.session_state.history.length, 0);
   } finally { f.mock.restore(); }
 });
