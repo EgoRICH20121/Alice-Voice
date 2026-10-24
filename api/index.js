@@ -15,8 +15,10 @@ const HISTORY_MODEL_CHARS = 130;
 
 // Яндекс Диалоги ждут ответ 4,5 с, считая сеть и холодный старт.
 // Свой бюджет делаем заметно меньше.
-const TOTAL_BUDGET_MS = 2700;
-const RESPONSE_SAFETY_MS = 350;
+// Оставляем запас до ограничения Яндекс Диалогов около 4,5 с,
+// но даём Gemini достаточно времени на основной и резервный вызовы.
+const TOTAL_BUDGET_MS = 3900;
+const RESPONSE_SAFETY_MS = 450;
 const GEMINI_FIRST_TIMEOUT_MS = 2000;
 const GEMINI_DETAILED_TIMEOUT_MS = 2500;
 const GEMINI_RETRY_TIMEOUT_MS = 1500;
