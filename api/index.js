@@ -7,7 +7,7 @@ const MAX_ALICE_TEXT = 1024;
 
 const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 1400;
-const GEMINI_TIMEOUT_MS = 1800;
+const GEMINI_TIMEOUT_MS = 3800;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
