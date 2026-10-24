@@ -701,3 +701,24 @@ test("global Alice deadline cancels the active downstream request", async () => 
     f.mock.restore();
   }
 });
+
+
+test("a missing primary Gemini model falls back to the configured backup", async () => {
+  const urls = [];
+  const f = mockFetch(async url => {
+    urls.push(String(url));
+    return urls.length === 1
+      ? json({ error: { code: 404, message: "model not found" } }, 404)
+      : geminiOk("Ответ запасной модели.");
+  });
+
+  try {
+    const { payload } = await call(turn("Какая столица Франции?"));
+    assert.equal(payload.response.text, "Ответ запасной модели.");
+    assert.equal(urls.length, 2);
+    assert.match(urls[0], /gemini-3\.5-flash-lite:generateContent/);
+    assert.match(urls[1], /gemini-3\.1-flash-lite:generateContent/);
+  } finally {
+    f.mock.restore();
+  }
+});
