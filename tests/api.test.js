@@ -452,7 +452,7 @@ test("11. hanging Gemini still yields a reply well inside the Yandex 4.5 s limit
     const { payload } = await call(turn("Расскажи про космос подробнее"));
     const elapsed = Date.now() - t0;
     assert.ok(elapsed < 3600, `took ${elapsed} ms`);
-    assert.match(payload.response.text, /не успела|не успела ответить|отведённое время/);
+    assert.match(payload.response.text, /не успела|не успела ответить|отведённое время/i);
     assert.equal(payload.session_state.history.length, 0);
   } finally { f.mock.restore(); }
 });
@@ -667,4 +667,58 @@ test("general search result is summarised by Gemini only when search is requeste
     assert.equal(r.log.map(x => x.api).join(), "serper,gemini");
     assert.match(payload.response.text, /90,5/);
   } finally { f.mock.restore(); }
+});
+
+
+test("global Alice deadline cancels the active downstream request", async () => {
+  let observedSignal;
+
+  const f = mockFetch((_url, opts) => {
+    observedSignal = opts.signal;
+
+    return new Promise((_, reject) => {
+      const fail = () => reject(observedSignal.reason || new Error("aborted"));
+      if (observedSignal.aborted) {
+        fail();
+        return;
+      }
+      observedSignal.addEventListener("abort", fail, { once: true });
+    });
+  });
+
+  const started = Date.now();
+
+  try {
+    const { payload } = await call(turn("Расскажи подробно про космос"));
+    const elapsed = Date.now() - started;
+
+    assert.match(payload.response.text, /не успела ответить вовремя/i);
+    assert.ok(elapsed < 3100, `took ${elapsed} ms`);
+    assert.ok(observedSignal, "fetch should receive an AbortSignal");
+    assert.equal(observedSignal.aborted, true, "deadline should abort the fetch");
+    assert.deepEqual(payload.session_state.history, []);
+  } finally {
+    f.mock.restore();
+  }
+});
+
+
+test("a missing primary Gemini model falls back to the configured backup", async () => {
+  const urls = [];
+  const f = mockFetch(async url => {
+    urls.push(String(url));
+    return urls.length === 1
+      ? json({ error: { code: 404, message: "model not found" } }, 404)
+      : geminiOk("Ответ запасной модели.");
+  });
+
+  try {
+    const { payload } = await call(turn("Какая столица Франции?"));
+    assert.equal(payload.response.text, "Ответ запасной модели.");
+    assert.equal(urls.length, 2);
+    assert.match(urls[0], /gemini-3\.5-flash-lite:generateContent/);
+    assert.match(urls[1], /gemini-3\.1-flash-lite:generateContent/);
+  } finally {
+    f.mock.restore();
+  }
 });

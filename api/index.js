@@ -15,7 +15,8 @@ const HISTORY_MODEL_CHARS = 130;
 
 // Яндекс Диалоги ждут ответ 4,5 с, считая сеть и холодный старт.
 // Свой бюджет делаем заметно меньше.
-const TOTAL_BUDGET_MS = 3200;
+const TOTAL_BUDGET_MS = 2700;
+const RESPONSE_SAFETY_MS = 350;
 const GEMINI_FIRST_TIMEOUT_MS = 2000;
 const GEMINI_DETAILED_TIMEOUT_MS = 2500;
 const GEMINI_RETRY_TIMEOUT_MS = 1500;
@@ -610,12 +611,17 @@ function generalQuery(text) {
 
 /* ------------------------------ сеть и Gemini ------------------------------ */
 
-async function fetchJson(url, options, timeoutMs) {
+async function fetchJson(url, options, timeoutMs, parentSignal) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    Math.max(100, timeoutMs)
+  );
+  const signals = [controller.signal, parentSignal].filter(Boolean);
+  const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 
   try {
-    const r = await fetch(url, { ...options, signal: controller.signal });
+    const r = await fetch(url, { ...options, signal });
     const raw = await r.text();
     let data = {};
 
@@ -630,7 +636,8 @@ async function fetchJson(url, options, timeoutMs) {
 }
 
 // Низкоуровневый вызов Gemini. Ключ передаётся только в заголовке и не логируется.
-async function callGemini({ model, system, contents, timeoutMs, maxTokens }) {
+async function callGemini({ model, system, contents, timeoutMs, maxTokens, signal, requestId }) {
+  const startedAt = Date.now();
   const key = process.env.GEMINI_API_KEY;
 
   if (!key) throw new Error("MISSING_GEMINI_API_KEY");
@@ -655,13 +662,22 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens }) {
           generationConfig: { maxOutputTokens: maxTokens }
         })
       },
-      timeoutMs
+      timeoutMs,
+      signal
     );
   } catch (e) {
-    console.error("Gemini fetch failed:", model, e?.name, e?.message);
+    console.error("Gemini fetch failed:", {
+      requestId,
+      model,
+      durationMs: Date.now() - startedAt,
+      errorName: e?.name,
+      errorMessage: e?.message
+    });
 
     throw new Error(
-      e?.name === "AbortError" ? "GEMINI_TIMEOUT" : "GEMINI_NETWORK_ERROR"
+      (e?.name === "AbortError" || e?.name === "TimeoutError" || e?.message === "Request timed out")
+        ? "GEMINI_TIMEOUT"
+        : "GEMINI_NETWORK_ERROR"
     );
   }
 
@@ -670,9 +686,13 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens }) {
 
     console.error(
       "Gemini HTTP error:",
-      model,
-      status,
-      JSON.stringify(result.data?.error || {}).slice(0, 600)
+      {
+        requestId,
+        model,
+        status,
+        durationMs: Date.now() - startedAt,
+        error: JSON.stringify(result.data?.error || {}).slice(0, 600)
+      }
     );
 
     if (status === 400) throw new Error("GEMINI_BAD_REQUEST");
@@ -691,7 +711,7 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens }) {
   if (!answer) {
     console.error(
       "Gemini empty response:",
-      model,
+      { requestId, model, durationMs: Date.now() - startedAt },
       JSON.stringify(
         result.data?.promptFeedback ||
         result.data?.candidates?.[0]?.finishReason ||
@@ -702,6 +722,11 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens }) {
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
 
+  console.log("Gemini success:", {
+    requestId,
+    model,
+    durationMs: Date.now() - startedAt
+  });
   return clean(answer);
 }
 
@@ -714,7 +739,7 @@ function buildSystemPrompt(memory, mode) {
   );
 }
 
-async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "short") {
+async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "short", signal, requestId) {
   const contents = safeHistory(history);
   const last = contents[contents.length - 1];
 
@@ -735,7 +760,9 @@ async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "s
     system: buildSystemPrompt(memory, mode),
     contents: sliced,
     timeoutMs,
-    maxTokens: mode === "detailed" ? MAX_TOKENS_DETAILED : MAX_TOKENS_SHORT
+    maxTokens: mode === "detailed" ? MAX_TOKENS_DETAILED : MAX_TOKENS_SHORT,
+    signal,
+    requestId
   });
 }
 
@@ -747,7 +774,8 @@ function isRetriable(error) {
     m === "GEMINI_TIMEOUT" ||
     m === "GEMINI_NETWORK_ERROR" ||
     m === "GEMINI_EMPTY_RESPONSE" ||
-    /^GEMINI_HTTP_5\d\d$/.test(m)
+    /^GEMINI_HTTP_5\d\d$/.test(m) ||
+    m === "GEMINI_HTTP_404"
   );
 }
 
@@ -786,23 +814,24 @@ async function tryModels(remaining, firstCap, retryCap, run) {
   throw lastError || new Error("NO_TIME_LEFT");
 }
 
-function askGemini(text, history, memory, remaining, mode = "short") {
+function askGemini(text, history, memory, remaining, mode = "short", signal, requestId) {
   return tryModels(
     remaining,
     mode === "detailed" ? GEMINI_DETAILED_TIMEOUT_MS : GEMINI_FIRST_TIMEOUT_MS,
     GEMINI_RETRY_TIMEOUT_MS,
-    (model, timeoutMs) => gemini(text, history, memory, timeoutMs, model, mode)
+    (model, timeoutMs) => gemini(text, history, memory, timeoutMs, model, mode, signal, requestId)
   );
 }
 
 /* ------------------------------ поиск ------------------------------ */
 
 // null — поиск недоступен или завершился ошибкой; [] — ничего не найдено.
-async function serper(query, kind, timeoutMs) {
+async function serper(query, kind, timeoutMs, signal, requestId) {
+  const startedAt = Date.now();
   const key = process.env.SERPER_API_KEY;
 
   if (!key) {
-    console.error("SERPER_API_KEY is missing");
+    console.error("Serper unavailable:", { requestId, reason: "missing_api_key" });
     return null;
   }
 
@@ -824,11 +853,17 @@ async function serper(query, kind, timeoutMs) {
           ...(news ? { tbs: "qdr:d" } : {})
         })
       },
-      timeoutMs
+      timeoutMs,
+      signal
     );
 
     if (!r.ok) {
-      console.error("Serper HTTP error:", r.status, JSON.stringify(data).slice(0, 400));
+      console.error("Serper HTTP error:", {
+        requestId,
+        status: r.status,
+        durationMs: Date.now() - startedAt,
+        error: JSON.stringify(data).slice(0, 400)
+      });
       return null;
     }
 
@@ -869,9 +904,20 @@ async function serper(query, kind, timeoutMs) {
       }
     }
 
+    console.log("Serper success:", {
+      requestId,
+      status: r.status,
+      durationMs: Date.now() - startedAt,
+      resultCount: results.length
+    });
     return results;
   } catch (e) {
-    console.error("Serper fetch failed:", e?.name, e?.message);
+    console.error("Serper fetch failed:", {
+      requestId,
+      durationMs: Date.now() - startedAt,
+      errorName: e?.name,
+      errorMessage: e?.message
+    });
     return null;
   }
 }
@@ -1091,7 +1137,7 @@ function numbersGrounded(answer, sources) {
 // Пересказ результатов поиска через Gemini. Возвращает null, если времени
 // мало, модель не ответила или в тексте появились числа, которых нет в
 // источниках — тогда используется детерминированный ответ.
-async function summarizeSearch(kind, results, userText, remaining) {
+async function summarizeSearch(kind, results, userText, remaining, signal, requestId) {
   const list = uniqueResults(results).slice(0, 5);
   if (!list.length || remaining() - SAFETY_MS < MIN_ATTEMPT_MS + 100) return null;
 
@@ -1116,7 +1162,9 @@ async function summarizeSearch(kind, results, userText, remaining) {
           parts: [{ text: `Вопрос пользователя: ${userText}\n\nРезультаты поиска:\n${sources}` }]
         }],
         timeoutMs,
-        maxTokens: MAX_TOKENS_DETAILED
+        maxTokens: MAX_TOKENS_DETAILED,
+        signal,
+        requestId
       })
     );
 
@@ -1179,6 +1227,8 @@ function errorText(error) {
       return "У Gemini закончился доступный лимит запросов. Попробуй позже.";
     case "GEMINI_BAD_REQUEST":
       return "Gemini отклонила формат запроса. Ошибка записана в лог Vercel.";
+    case "GEMINI_HTTP_404":
+      return "Gemini не нашла указанную модель. Проверь GEMINI_MODEL в Vercel или укажи доступную модель; запасная модель тоже не ответила.";
     case "GEMINI_HTTP_503":
       return "Gemini сейчас перегружена и временно не отвечает. Попробуй ещё раз через несколько секунд.";
     case "GEMINI_TIMEOUT":
@@ -1197,7 +1247,7 @@ function errorText(error) {
 
 // Возвращает { text, history, userStateUpdate?, sessionExtra? }.
 // Ошибки Gemini пробрасываются наружу: в историю они не попадают.
-async function processTurn(body, history, remaining) {
+async function processTurn(body, history, remaining, signal, requestId) {
   const text = clean(
     body?.request?.original_utterance || body?.request?.command || "",
     500
@@ -1286,13 +1336,15 @@ async function processTurn(body, history, remaining) {
     const results = await serper(
       query,
       kind,
-      Math.min(SERPER_TIMEOUT_MS, remaining() - SAFETY_MS)
+      Math.min(SERPER_TIMEOUT_MS, remaining() - SAFETY_MS),
+      signal,
+      requestId
     );
 
     let answer = null;
 
     if (kind !== "weather" && results?.length) {
-      answer = await summarizeSearch(kind, results, text, remaining);
+      answer = await summarizeSearch(kind, results, text, remaining, signal, requestId);
     }
 
     answer = answer || buildSearchAnswer(kind, results, ctx);
@@ -1333,7 +1385,7 @@ async function processTurn(body, history, remaining) {
       : `Ответь коротко на вопрос: ${lastUser}`;
   }
 
-  const answer = await askGemini(question, history, memory, remaining, mode);
+  const answer = await askGemini(question, history, memory, remaining, mode, signal, requestId);
 
   return {
     text: answer,
@@ -1357,7 +1409,10 @@ export default async function handler(req, res) {
   }
 
   const started = Date.now();
+  const requestId = globalThis.crypto?.randomUUID?.() ||
+    `${started.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const remaining = () => TOTAL_BUDGET_MS - (Date.now() - started);
+  console.log("Alice request started:", { requestId, method: req.method });
 
   let body = req.body;
 
@@ -1373,17 +1428,28 @@ export default async function handler(req, res) {
 
   const history = extractHistory(body);
 
-  // Жёсткий дедлайн: что бы ни происходило, отвечаем до лимита Диалогов.
+  // Единый дедлайн: заранее отвечаем Алисе и отменяем незавершённые API-вызовы.
+  const requestController = new AbortController();
   let timer;
+  let deadlineReached = false;
 
   const deadline = new Promise(resolve => {
     timer = setTimeout(
-      () => resolve({
-        text: "Не успела ответить вовремя. Повтори вопрос, пожалуйста.",
-        history,
-        sessionExtra: body?.state?.session?.detail === 1 ? { detail: 1 } : undefined
-      }),
-      Math.max(200, remaining() - 100)
+      () => {
+        deadlineReached = true;
+        console.warn("Alice deadline reached:", {
+          requestId,
+          durationMs: Date.now() - started,
+          remainingMs: remaining()
+        });
+        requestController.abort(new DOMException("Alice response deadline exceeded", "TimeoutError"));
+        resolve({
+          text: "Не успела ответить вовремя. Повтори вопрос, пожалуйста.",
+          history,
+          sessionExtra: body?.state?.session?.detail === 1 ? { detail: 1 } : undefined
+        });
+      },
+      Math.max(200, remaining() - RESPONSE_SAFETY_MS)
     );
   });
 
@@ -1391,15 +1457,28 @@ export default async function handler(req, res) {
 
   try {
     result = await Promise.race([
-      processTurn(body, history, remaining),
+      processTurn(body, history, remaining, requestController.signal, requestId),
       deadline
     ]);
   } catch (error) {
-    console.error("Alice handler error:", error?.message || error);
+    console.error("Alice handler error:", {
+      requestId,
+      durationMs: Date.now() - started,
+      error: error?.message || String(error)
+    });
     result = { text: errorText(error), history };
   } finally {
     clearTimeout(timer);
+    if (deadlineReached) requestController.abort();
   }
+
+  console.log("Alice request completed:", {
+    requestId,
+    durationMs: Date.now() - started,
+    timedOut: deadlineReached,
+    responseLength: String(result.text || "").length,
+    historyEntries: Array.isArray(result.history) ? result.history.length : 0
+  });
 
   return response(
     res,
