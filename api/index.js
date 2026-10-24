@@ -5,17 +5,16 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 
-// Оставляем запас до ограничения времени ответа Алисы.
-const TOTAL_RESPONSE_BUDGET_MS = 4300;
-const SERPER_TIMEOUT_MS = 350;
-const GEMINI_TIMEOUT_MS = 3900;
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const SERPER_TIMEOUT_MS = 300;
+const GEMINI_TIMEOUT_MS = 3800;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и понятно.",
   "Обычно используй 1–3 коротких предложения.",
-  "Не используй Markdown, таблицы, списки с символами и длинные вступления.",
-  "Для актуальных данных используй предоставленные результаты поиска.",
+  "Не используй Markdown, таблицы и длинные вступления.",
+  "Для актуальных данных используй результаты поиска, если они переданы.",
   "Не выдумывай факты. Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -80,8 +79,10 @@ function safeHistory(history) {
 
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timeout = Math.max(100, timeoutMs);
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(
+    () => controller.abort(),
+    Math.max(100, timeoutMs)
+  );
 
   try {
     const response = await fetch(url, {
@@ -180,7 +181,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска:\n${searchContext}\nИспользуй только относящиеся к вопросу сведения.`
+    ? `${text}\n\nРезультаты поиска:\n${searchContext}\nИспользуй только сведения, относящиеся к вопросу.`
     : text;
 
   contents.push({
@@ -205,8 +206,10 @@ async function askGemini(text, history, searchContext, timeoutMs) {
           },
           contents,
           generationConfig: {
-            temperature: 0.5,
-            maxOutputTokens: 180
+            maxOutputTokens: 160,
+            thinkingConfig: {
+              thinkingLevel: "MINIMAL"
+            }
           }
         })
       },
@@ -255,13 +258,13 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
-      return "Сервер не настроен. Проверьте GEMINI_API_KEY в настройках Vercel.";
+      return "Сервер не настроен. Проверьте GEMINI_API_KEY в Vercel.";
 
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось авторизоваться в Gemini. Проверьте API-ключ в Vercel.";
+      return "Не удалось авторизоваться в Gemini. Проверьте API-ключ.";
 
     case "GEMINI_QUOTA":
-      return "Достигнут лимит запросов Gemini. Попробуйте немного позже.";
+      return "Достигнут лимит запросов Gemini. Попробуйте позже.";
 
     case "GEMINI_BAD_REQUEST":
       return "Gemini отклонила запрос. Попробуйте задать вопрос иначе.";
@@ -274,7 +277,7 @@ function errorForUser(error) {
       return "Нейросеть отвечает слишком медленно. Попробуйте ещё раз.";
 
     case "GEMINI_EMPTY_RESPONSE":
-      return "Нейросеть не вернула ответ. Попробуйте задать вопрос иначе.";
+      return "Нейросеть не вернула ответ. Попробуйте спросить иначе.";
 
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте позже.";
@@ -325,8 +328,7 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
 
-    // Поиск выполняется только для актуальных вопросов.
-    // Если времени мало, пропускаем поиск и сразу спрашиваем Gemini.
+    // При нехватке времени пропускаем поиск и сразу обращаемся к Gemini.
     if (
       isSearchIntent(text) &&
       process.env.SERPER_API_KEY &&
@@ -334,13 +336,13 @@ export default async function handler(req, res) {
     ) {
       searchContext = await searchWeb(
         text,
-        Math.min(SERPER_TIMEOUT_MS, remainingMs() - 3700)
+        Math.min(SERPER_TIMEOUT_MS, remainingMs() - 3600)
       );
     }
 
     const geminiTimeout = Math.min(
       GEMINI_TIMEOUT_MS,
-      remainingMs() - 200
+      remainingMs() - 150
     );
 
     const answer = await askGemini(
