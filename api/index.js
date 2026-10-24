@@ -210,7 +210,7 @@ async function askGemini(userText, history) {
         contents,
         generationConfig: {
           temperature: 0.6,
-          maxOutputTokens: 160,
+          maxOutputTokens: 100,
           thinkingConfig: {
             thinkingLevel: "MINIMAL"
           }
