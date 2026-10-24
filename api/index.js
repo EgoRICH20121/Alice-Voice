@@ -1,4 +1,4 @@
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const MAX_ALICE_TEXT = 1024;
 const MAX_HISTORY = 8;
 const TOTAL_BUDGET_MS = 4100;
