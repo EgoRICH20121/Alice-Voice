@@ -15,7 +15,8 @@ const HISTORY_MODEL_CHARS = 130;
 
 // Яндекс Диалоги ждут ответ 4,5 с, считая сеть и холодный старт.
 // Свой бюджет делаем заметно меньше.
-const TOTAL_BUDGET_MS = 3200;
+const TOTAL_BUDGET_MS = 2700;
+const RESPONSE_SAFETY_MS = 350;
 const GEMINI_FIRST_TIMEOUT_MS = 2000;
 const GEMINI_DETAILED_TIMEOUT_MS = 2500;
 const GEMINI_RETRY_TIMEOUT_MS = 1500;
@@ -610,12 +611,17 @@ function generalQuery(text) {
 
 /* ------------------------------ сеть и Gemini ------------------------------ */
 
-async function fetchJson(url, options, timeoutMs) {
+async function fetchJson(url, options, timeoutMs, parentSignal) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("Request timed out", "TimeoutError")),
+    Math.max(100, timeoutMs)
+  );
+  const signals = [controller.signal, parentSignal].filter(Boolean);
+  const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 
   try {
-    const r = await fetch(url, { ...options, signal: controller.signal });
+    const r = await fetch(url, { ...options, signal });
     const raw = await r.text();
     let data = {};
 
@@ -630,7 +636,7 @@ async function fetchJson(url, options, timeoutMs) {
 }
 
 // Низкоуровневый вызов Gemini. Ключ передаётся только в заголовке и не логируется.
-async function callGemini({ model, system, contents, timeoutMs, maxTokens }) {
+async function callGemini({ model, system, contents, timeoutMs, maxTokens, signal }) {
   const key = process.env.GEMINI_API_KEY;
 
   if (!key) throw new Error("MISSING_GEMINI_API_KEY");
@@ -655,13 +661,16 @@ async function callGemini({ model, system, contents, timeoutMs, maxTokens }) {
           generationConfig: { maxOutputTokens: maxTokens }
         })
       },
-      timeoutMs
+      timeoutMs,
+      signal
     );
   } catch (e) {
     console.error("Gemini fetch failed:", model, e?.name, e?.message);
 
     throw new Error(
-      e?.name === "AbortError" ? "GEMINI_TIMEOUT" : "GEMINI_NETWORK_ERROR"
+      (e?.name === "AbortError" || e?.name === "TimeoutError" || e?.message === "Request timed out")
+        ? "GEMINI_TIMEOUT"
+        : "GEMINI_NETWORK_ERROR"
     );
   }
 
@@ -714,7 +723,7 @@ function buildSystemPrompt(memory, mode) {
   );
 }
 
-async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "short") {
+async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "short", signal) {
   const contents = safeHistory(history);
   const last = contents[contents.length - 1];
 
@@ -735,7 +744,8 @@ async function gemini(text, history, memory, timeoutMs, model = MODEL, mode = "s
     system: buildSystemPrompt(memory, mode),
     contents: sliced,
     timeoutMs,
-    maxTokens: mode === "detailed" ? MAX_TOKENS_DETAILED : MAX_TOKENS_SHORT
+    maxTokens: mode === "detailed" ? MAX_TOKENS_DETAILED : MAX_TOKENS_SHORT,
+    signal
   });
 }
 
@@ -786,19 +796,19 @@ async function tryModels(remaining, firstCap, retryCap, run) {
   throw lastError || new Error("NO_TIME_LEFT");
 }
 
-function askGemini(text, history, memory, remaining, mode = "short") {
+function askGemini(text, history, memory, remaining, mode = "short", signal) {
   return tryModels(
     remaining,
     mode === "detailed" ? GEMINI_DETAILED_TIMEOUT_MS : GEMINI_FIRST_TIMEOUT_MS,
     GEMINI_RETRY_TIMEOUT_MS,
-    (model, timeoutMs) => gemini(text, history, memory, timeoutMs, model, mode)
+    (model, timeoutMs) => gemini(text, history, memory, timeoutMs, model, mode, signal)
   );
 }
 
 /* ------------------------------ поиск ------------------------------ */
 
 // null — поиск недоступен или завершился ошибкой; [] — ничего не найдено.
-async function serper(query, kind, timeoutMs) {
+async function serper(query, kind, timeoutMs, signal) {
   const key = process.env.SERPER_API_KEY;
 
   if (!key) {
@@ -824,7 +834,8 @@ async function serper(query, kind, timeoutMs) {
           ...(news ? { tbs: "qdr:d" } : {})
         })
       },
-      timeoutMs
+      timeoutMs,
+      signal
     );
 
     if (!r.ok) {
@@ -1091,7 +1102,7 @@ function numbersGrounded(answer, sources) {
 // Пересказ результатов поиска через Gemini. Возвращает null, если времени
 // мало, модель не ответила или в тексте появились числа, которых нет в
 // источниках — тогда используется детерминированный ответ.
-async function summarizeSearch(kind, results, userText, remaining) {
+async function summarizeSearch(kind, results, userText, remaining, signal) {
   const list = uniqueResults(results).slice(0, 5);
   if (!list.length || remaining() - SAFETY_MS < MIN_ATTEMPT_MS + 100) return null;
 
@@ -1116,7 +1127,8 @@ async function summarizeSearch(kind, results, userText, remaining) {
           parts: [{ text: `Вопрос пользователя: ${userText}\n\nРезультаты поиска:\n${sources}` }]
         }],
         timeoutMs,
-        maxTokens: MAX_TOKENS_DETAILED
+        maxTokens: MAX_TOKENS_DETAILED,
+        signal
       })
     );
 
@@ -1197,7 +1209,7 @@ function errorText(error) {
 
 // Возвращает { text, history, userStateUpdate?, sessionExtra? }.
 // Ошибки Gemini пробрасываются наружу: в историю они не попадают.
-async function processTurn(body, history, remaining) {
+async function processTurn(body, history, remaining, signal) {
   const text = clean(
     body?.request?.original_utterance || body?.request?.command || "",
     500
@@ -1286,13 +1298,14 @@ async function processTurn(body, history, remaining) {
     const results = await serper(
       query,
       kind,
-      Math.min(SERPER_TIMEOUT_MS, remaining() - SAFETY_MS)
+      Math.min(SERPER_TIMEOUT_MS, remaining() - SAFETY_MS),
+      signal
     );
 
     let answer = null;
 
     if (kind !== "weather" && results?.length) {
-      answer = await summarizeSearch(kind, results, text, remaining);
+      answer = await summarizeSearch(kind, results, text, remaining, signal);
     }
 
     answer = answer || buildSearchAnswer(kind, results, ctx);
@@ -1333,7 +1346,7 @@ async function processTurn(body, history, remaining) {
       : `Ответь коротко на вопрос: ${lastUser}`;
   }
 
-  const answer = await askGemini(question, history, memory, remaining, mode);
+  const answer = await askGemini(question, history, memory, remaining, mode, signal);
 
   return {
     text: answer,
@@ -1373,17 +1386,23 @@ export default async function handler(req, res) {
 
   const history = extractHistory(body);
 
-  // Жёсткий дедлайн: что бы ни происходило, отвечаем до лимита Диалогов.
+  // Единый дедлайн: заранее отвечаем Алисе и отменяем незавершённые API-вызовы.
+  const requestController = new AbortController();
   let timer;
+  let deadlineReached = false;
 
   const deadline = new Promise(resolve => {
     timer = setTimeout(
-      () => resolve({
-        text: "Не успела ответить вовремя. Повтори вопрос, пожалуйста.",
-        history,
-        sessionExtra: body?.state?.session?.detail === 1 ? { detail: 1 } : undefined
-      }),
-      Math.max(200, remaining() - 100)
+      () => {
+        deadlineReached = true;
+        requestController.abort(new DOMException("Alice response deadline exceeded", "TimeoutError"));
+        resolve({
+          text: "Не успела ответить вовремя. Повтори вопрос, пожалуйста.",
+          history,
+          sessionExtra: body?.state?.session?.detail === 1 ? { detail: 1 } : undefined
+        });
+      },
+      Math.max(200, remaining() - RESPONSE_SAFETY_MS)
     );
   });
 
@@ -1391,7 +1410,7 @@ export default async function handler(req, res) {
 
   try {
     result = await Promise.race([
-      processTurn(body, history, remaining),
+      processTurn(body, history, remaining, requestController.signal),
       deadline
     ]);
   } catch (error) {
@@ -1399,6 +1418,7 @@ export default async function handler(req, res) {
     result = { text: errorText(error), history };
   } finally {
     clearTimeout(timer);
+    if (deadlineReached) requestController.abort();
   }
 
   return response(
