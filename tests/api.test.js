@@ -650,6 +650,29 @@ test("6f. unexpected Serper response shape is not mistaken for an empty news lis
   } finally { f.mock.restore(); }
 });
 
+test("6h. a Serper news timeout gets one bounded retry and can recover", async () => {
+  let attempts = 0;
+  const r = router({
+    serper: async () => {
+      attempts++;
+      if (attempts === 1) {
+        const error = new Error("Request timed out");
+        error.name = "TimeoutError";
+        throw error;
+      }
+      return json(NEWS);
+    },
+    gemini: async () => geminiOk("Появились новые новости о технологиях.")
+  });
+  const f = mockFetch(r.impl);
+  try {
+    const { payload } = await call(turn("последние новости про озу"));
+    assert.equal(attempts, 2);
+    assert.equal(r.log.filter(x => x.api === "gemini").length, 1);
+    assert.doesNotMatch(payload.response.text, /Поиск сейчас недоступен/);
+  } finally { f.mock.restore(); }
+});
+
 test("6g. Serper authorization, rate-limit and server errors do not trigger weekly fallback", async () => {
   for (const status of [401, 429, 500]) {
     const r = router({ serper: async () => json({ error: "upstream failure" }, status) });
