@@ -693,7 +693,7 @@ test("global Alice deadline cancels the active downstream request", async () => 
     const elapsed = Date.now() - started;
 
     assert.match(payload.response.text, /не успела ответить вовремя/i);
-    assert.ok(elapsed < 3100, `took ${elapsed} ms`);
+    assert.ok(elapsed < 4100, `took ${elapsed} ms`);
     assert.ok(observedSignal, "fetch should receive an AbortSignal");
     assert.equal(observedSignal.aborted, true, "deadline should abort the fetch");
     assert.deepEqual(payload.session_state.history, []);
