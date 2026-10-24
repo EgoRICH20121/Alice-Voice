@@ -1,7 +1,7 @@
 
 const MODEL = "gemini-3.5-flash-lite";
-const GEMINI_TIMEOUT_MS = 3800;
-const SERPER_TIMEOUT_MS = 1800;
+const GEMINI_TIMEOUT_MS = 2800;
+const SERPER_TIMEOUT_MS = 1400;
 const MAX_TEXT = 1024;
 const MAX_HISTORY = 12;
 
@@ -9,26 +9,50 @@ const SYSTEM_INSTRUCTION = `
 Ты — голосовой собеседник Алисы. Общайся естественно,
 дружелюбно и на русском языке.
 
-ГЛАВНОЕ ПРАВИЛО: отвечай кратко, как для умной колонки.
-
-- На приветствие отвечай одной короткой фразой.
-- На простой вопрос отвечай одним-двумя предложениями.
-- Не повторяй вопрос пользователя.
-- Не добавляй вступления, выводы и предложения помощи без необходимости.
-- Не перечисляй варианты, если пользователь их не просил.
-- Если пользователь просит кратко — отвечай максимально сжато.
-- Если пользователь просит подробности, объясняй подробнее.
-- Поддерживай естественный разговор и учитывай предыдущие сообщения.
-- Не выдумывай факты и личные предпочтения пользователя.
-- Если не знаешь личную информацию, честно скажи об этом.
-- Не используй Markdown, списки и таблицы без необходимости.
+Отвечай кратко, как для умной колонки.
+На приветствие отвечай одной короткой фразой.
+На простой вопрос отвечай одним-двумя предложениями.
+Не повторяй вопрос пользователя.
+Не добавляй ненужные вступления и предложения помощи.
+Если пользователь просит подробности, объясняй подробнее.
+Учитывай предыдущие сообщения и факты, сообщённые пользователем.
+Не выдумывай личные предпочтения пользователя.
+Если не знаешь личную информацию, честно скажи об этом.
+Не используй Markdown, списки и таблицы без необходимости.
 `.trim();
 
 function cleanText(value, max = MAX_TEXT) {
   return String(value ?? "")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, max);
+    .slice(0, max)
+    .trim();
+}
+
+function cleanSnippet(value, max = 160) {
+  let text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/[…]+/g, " ")
+    .replace(/\.{2,}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  text = text.replace(/^[\s.,;:—-]+|[\s.,;:—-]+$/g, "");
+
+  if (text.length > max) {
+    const shortened = text.slice(0, max);
+    const lastSentence = Math.max(
+      shortened.lastIndexOf(". "),
+      shortened.lastIndexOf("! "),
+      shortened.lastIndexOf("? ")
+    );
+
+    text = lastSentence > max * 0.45
+      ? shortened.slice(0, lastSentence + 1)
+      : shortened.slice(0, max).replace(/\s+\S*$/, "");
+  }
+
+  return text.trim();
 }
 
 function getHistory(body) {
@@ -89,10 +113,7 @@ function extractSearchQuery(text) {
 
 async function fetchJsonWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs
-  );
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, {
@@ -135,7 +156,7 @@ async function searchWeb(query) {
         q: query,
         gl: "ru",
         hl: "ru",
-        num: 3
+        num: 5
       })
     },
     SERPER_TIMEOUT_MS
@@ -147,33 +168,64 @@ async function searchWeb(query) {
   }
 
   const results = [];
+  const seenTitles = new Set();
 
-  if (data.answerBox?.answer) {
-    results.push(cleanText(data.answerBox.answer, 250));
-  } else if (data.answerBox?.snippet) {
-    results.push(cleanText(data.answerBox.snippet, 250));
+  const answerBox = data.answerBox;
+  if (answerBox?.answer || answerBox?.snippet) {
+    const answer = cleanSnippet(
+      answerBox.answer || answerBox.snippet,
+      180
+    );
+
+    if (answer) {
+      results.push({
+        title: "Краткий ответ",
+        snippet: answer
+      });
+    }
   }
 
   const organic = Array.isArray(data.organic)
     ? data.organic
     : [];
 
-  for (const item of organic.slice(0, 3)) {
-    const title = cleanText(item?.title, 140);
-    const snippet = cleanText(item?.snippet, 240);
+  for (const item of organic) {
+    const title = cleanSnippet(item?.title, 110);
+    const snippet = cleanSnippet(item?.snippet, 160);
 
-    if (title || snippet) {
-      results.push(
-        title && snippet
-          ? `${title}. ${snippet}`
-          : title || snippet
-      );
-    }
+    if (!title && !snippet) continue;
+
+    const key = (title || snippet).toLowerCase();
+
+    if (seenTitles.has(key)) continue;
+    seenTitles.add(key);
+
+    results.push({
+      title,
+      snippet
+    });
+
+    if (results.length >= 3) break;
   }
 
-  return results.length
-    ? results.join(". ").slice(0, 850)
-    : null;
+  return results.length ? results.slice(0, 3) : null;
+}
+
+function formatSearchResults(results) {
+  const parts = results.map((item, index) => {
+    const title = item.title
+      ? `${index + 1}. ${item.title}.`
+      : `${index + 1}.`;
+
+    return item.snippet
+      ? `${title} ${item.snippet}`
+      : title;
+  });
+
+  return cleanText(
+    `Вот что удалось найти. ${parts.join(" ")}`,
+    MAX_TEXT
+  );
 }
 
 async function askGemini(userText, history) {
@@ -247,7 +299,6 @@ async function askGemini(userText, history) {
   return cleanText(answer);
 }
 
-// ВАЖНО: проект использует ES Modules, поэтому нужен export default.
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
 
@@ -276,6 +327,7 @@ export default async function handler(req, res) {
   const userText = cleanText(
     request.original_utterance || request.command || ""
   );
+
   const history = getHistory(body);
 
   if (!userText) {
@@ -296,21 +348,19 @@ export default async function handler(req, res) {
       const query = extractSearchQuery(userText);
       console.log("Search request:", query);
 
-      // Поиск отвечает напрямую — без второго медленного запроса к Gemini.
       const results = await searchWeb(query);
 
       if (!results) {
-        return aliceResponse(
-          res,
-          "Сейчас не получилось получить данные из интернета. Попробуйте ещё раз позже.",
-          updatedHistory
-        );
+        const message =
+          "Сейчас не получилось получить данные из интернета. Попробуйте позже.";
+
+        return aliceResponse(res, message, [
+          ...updatedHistory,
+          { role: "model", text: message }
+        ]);
       }
 
-      const answer = cleanText(
-        `Вот что удалось найти. ${results}`,
-        MAX_TEXT
-      );
+      const answer = formatSearchResults(results);
 
       return aliceResponse(res, answer, [
         ...updatedHistory,
@@ -336,6 +386,9 @@ export default async function handler(req, res) {
         ? "Запрос занял слишком много времени. Попробуйте ещё раз."
         : "Произошла временная ошибка. Попробуйте ещё раз.";
 
-    return aliceResponse(res, message, updatedHistory);
+    return aliceResponse(res, message, [
+      ...updatedHistory,
+      { role: "model", text: message }
+    ]);
   }
 }
