@@ -1,4 +1,3 @@
-
 const MODEL = "gemini-3.5-flash-lite";
 
 const TOTAL_BUDGET_MS = 4100;
@@ -86,6 +85,142 @@ function getHistory(body) {
     }));
 }
 
+function fitMemoryFacts(facts) {
+  const result = [];
+
+  for (const value of facts.slice(-12)) {
+    const fact = cleanText(value, 120);
+    if (!fact) continue;
+
+    const candidate = [...result, fact];
+
+    // Храним запас до лимита Яндекс Диалогов в 1 КБ.
+    if (
+      Buffer.byteLength(
+        JSON.stringify({ memory: { facts: candidate } }),
+        "utf8"
+      ) > 850
+    ) {
+      continue;
+    }
+
+    result.push(fact);
+  }
+
+  return result;
+}
+
+function getUserMemory(body) {
+  const facts = body?.state?.user?.memory?.facts;
+
+  if (!Array.isArray(facts)) return [];
+
+  return fitMemoryFacts(
+    facts.filter(
+      item => typeof item === "string" && item.trim()
+    )
+  );
+}
+
+function getMemoryCommand(text) {
+  const remember = text.match(
+    /^(?:алиса[, ]*)?(?:запомни|запомни пожалуйста)\s*(?:,?\s*что\s*)?(.+)$/i
+  );
+
+  if (remember) {
+    const fact = cleanText(
+      remember[1].replace(/[.!?]+$/, ""),
+      120
+    );
+
+    if (fact && !/^(это|всё|ничего)$/i.test(fact)) {
+      return { type: "remember", fact };
+    }
+  }
+
+  const forget = text.match(
+    /^(?:алиса[, ]*)?(?:забудь|удали из памяти|не запоминай)\s*(?:,?\s*)?(.*)$/i
+  );
+
+  if (forget) {
+    return {
+      type: "forget",
+      target: cleanText(
+        forget[1].replace(/[.!?]+$/, ""),
+        180
+      )
+    };
+  }
+
+  return null;
+}
+
+function normalizeFact(value) {
+  return cleanText(value, 180)
+    .toLocaleLowerCase("ru-RU")
+    .replace(/[.,!?;:]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function memoryCommandResult(command, memory) {
+  if (command.type === "remember") {
+    const normalized = normalizeFact(command.fact);
+
+    const facts = memory.filter(
+      item => normalizeFact(item) !== normalized
+    );
+
+    facts.push(command.fact);
+
+    return {
+      facts: fitMemoryFacts(facts),
+      answer: `Хорошо, запомнила: ${command.fact}.`,
+      changed: true
+    };
+  }
+
+  if (!command.target) {
+    return {
+      facts: memory,
+      answer: memory.length
+        ? `Я помню: ${memory.join("; ")}. Чтобы удалить факт, скажи, что именно забыть.`
+        : "Пока у меня нет сохранённых фактов.",
+      changed: false
+    };
+  }
+
+  const target = normalizeFact(command.target);
+  const targetWords = target
+    .split(" ")
+    .filter(word => word.length > 2);
+
+  const kept = memory.filter(fact => {
+    const normalized = normalizeFact(fact);
+
+    return !(
+      normalized.includes(target) ||
+      target.includes(normalized) ||
+      (
+        targetWords.length > 0 &&
+        targetWords.every(
+          word => normalized.includes(word)
+        )
+      )
+    );
+  });
+
+  const changed = kept.length !== memory.length;
+
+  return {
+    facts: fitMemoryFacts(kept),
+    answer: changed
+      ? "Хорошо, удалила это из памяти."
+      : "Не нашла такой факт в сохранённой памяти.",
+    changed
+  };
+}
+
 function buildHistory(history, userText, answer) {
   const result = [...history];
 
@@ -111,12 +246,17 @@ function buildHistory(history, userText, answer) {
   return result.slice(-MAX_HISTORY);
 }
 
-function aliceResponse(res, text, history = []) {
+function aliceResponse(
+  res,
+  text,
+  history = [],
+  userStateUpdate = null
+) {
   const safeText =
     cleanText(text) ||
     "Не удалось подготовить ответ. Попробуйте ещё раз.";
 
-  return res.status(200).json({
+  const payload = {
     version: "1.0",
     response: {
       text: safeText,
@@ -125,7 +265,13 @@ function aliceResponse(res, text, history = []) {
     session_state: {
       history: history.slice(-MAX_HISTORY)
     }
-  });
+  };
+
+  if (userStateUpdate) {
+    payload.user_state_update = userStateUpdate;
+  }
+
+  return res.status(200).json(payload);
 }
 
 function isWeatherIntent(text) {
@@ -134,7 +280,7 @@ function isWeatherIntent(text) {
 }
 
 function isNewsIntent(text) {
-  return /последн\w*\s+новост\w*|новост\w*|что произошло|что случилось|свеж\w*\s+новост\w*|новост\w*\s+за сегодня|события в мире/i
+  return /последн\w*\s+новост\w*|новост\w*|что произошло|что случилось|что нового|свеж\w*\s+новост\w*|события в мире/i
     .test(text);
 }
 
@@ -175,7 +321,7 @@ function extractSearchQuery(text) {
   }
 
   if (isNewsIntent(original)) {
-    return `${original} последние актуальные новости дата`;
+    return `${original} новости за последние 24 часа дата публикации`;
   }
 
   return original
@@ -186,8 +332,13 @@ function extractSearchQuery(text) {
     .trim() || original;
 }
 
-async function fetchJsonWithTimeout(url, options, timeoutMs) {
+async function fetchJsonWithTimeout(
+  url,
+  options,
+  timeoutMs
+) {
   const controller = new AbortController();
+
   const timer = setTimeout(
     () => controller.abort(),
     Math.max(1, timeoutMs)
@@ -225,8 +376,14 @@ async function searchWeb(query, timeoutMs) {
   if (timeoutMs <= 0) return null;
 
   try {
+    const newsSearch = isNewsIntent(query);
+
+    const endpoint = newsSearch
+      ? "https://google.serper.dev/news"
+      : "https://google.serper.dev/search";
+
     const { response, data } = await fetchJsonWithTimeout(
-      "https://google.serper.dev/search",
+      endpoint,
       {
         method: "POST",
         headers: {
@@ -237,7 +394,8 @@ async function searchWeb(query, timeoutMs) {
           q: query,
           gl: "ru",
           hl: "ru",
-          num: 5
+          num: newsSearch ? 6 : 5,
+          ...(newsSearch ? { tbs: "qdr:d" } : {})
         })
       },
       timeoutMs
@@ -264,11 +422,11 @@ async function searchWeb(query, timeoutMs) {
       });
     }
 
-    const organic = Array.isArray(data.organic)
-      ? data.organic
-      : [];
+    const organic = newsSearch
+      ? (Array.isArray(data.news) ? data.news : [])
+      : (Array.isArray(data.organic) ? data.organic : []);
 
-    for (const item of organic.slice(0, 5)) {
+    for (const item of organic.slice(0, newsSearch ? 6 : 5)) {
       const title = cleanText(item?.title, 180);
       const snippet = cleanText(item?.snippet, 350);
       const date = cleanText(item?.date, 80);
@@ -289,6 +447,7 @@ async function searchWeb(query, timeoutMs) {
       error?.name || "Error",
       cleanText(error?.message, 160)
     );
+
     return null;
   }
 }
@@ -313,7 +472,8 @@ async function askGemini(
   userText,
   history,
   timeoutMs,
-  searchResults = null
+  searchResults = null,
+  userMemory = []
 ) {
   const apiKey = process.env.GEMINI_API_KEY;
 
@@ -389,9 +549,14 @@ async function askGemini(
         body: JSON.stringify({
           systemInstruction: {
             parts: [{
-              text: searchResults
-                ? SEARCH_INSTRUCTION
-                : SYSTEM_INSTRUCTION
+              text:
+                (searchResults
+                  ? SEARCH_INSTRUCTION
+                  : SYSTEM_INSTRUCTION) +
+                (userMemory.length
+                  ? "\n\nСохранённые факты, которые пользователь явно просил запомнить. Используй их, когда вопрос относится к ним; не выдумывай другие факты: " +
+                    userMemory.join("; ")
+                  : "")
             }]
           },
           contents: normalizedContents.slice(-8),
@@ -439,7 +604,12 @@ async function askGemini(
   }
 }
 
-function fallbackSearchAnswer(results, weather, news, sports) {
+function fallbackSearchAnswer(
+  results,
+  weather,
+  news,
+  sports
+) {
   if (!results?.length) {
     if (weather) {
       return "Не удалось получить свежий прогноз для этого населённого пункта. Попробуйте ещё раз.";
@@ -513,12 +683,33 @@ export default async function handler(req, res) {
   );
 
   const history = getHistory(body);
+  const userMemory = getUserMemory(body);
 
   if (!userText) {
     return aliceResponse(
       res,
       "Не расслышала вопрос. Повторите, пожалуйста.",
       history
+    );
+  }
+
+  const memoryCommand = getMemoryCommand(userText);
+
+  if (memoryCommand) {
+    const result = memoryCommandResult(
+      memoryCommand,
+      userMemory
+    );
+
+    const update = result.changed
+      ? { memory: { facts: result.facts } }
+      : null;
+
+    return aliceResponse(
+      res,
+      result.answer,
+      buildHistory(history, userText, result.answer),
+      update
     );
   }
 
@@ -529,6 +720,7 @@ export default async function handler(req, res) {
   try {
     if (isSearchIntent(userText)) {
       const query = extractSearchQuery(userText);
+
       console.log("Search request:", query);
 
       const searchTimeout = Math.min(
@@ -556,7 +748,8 @@ export default async function handler(req, res) {
               GEMINI_TIMEOUT_MS,
               remaining - 250
             ),
-            formatSearchResults(results)
+            formatSearchResults(results),
+            userMemory
           );
         }
 
@@ -592,7 +785,9 @@ export default async function handler(req, res) {
       Math.min(
         GEMINI_TIMEOUT_MS,
         Math.max(0, remaining - 200)
-      )
+      ),
+      null,
+      userMemory
     );
 
     const finalAnswer =
