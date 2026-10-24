@@ -1,270 +1,230 @@
-const MODEL = "gemini-3.5-flash-lite";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+const MAX_ALICE_TEXT = 1024;
+const MAX_HISTORY = 8;
+const TOTAL_BUDGET_MS = 4100;
+const GEMINI_TIMEOUT_MS = 3500;
+const SERPER_TIMEOUT_MS = 2200;
 
-const TOTAL_BUDGET_MS = 4200;
-const SERPER_TIMEOUT_MS = 3000;
-const GEMINI_TIMEOUT_MS = 3700;
+const SYSTEM_PROMPT = [
+  "Ты — голосовой помощник навыка Яндекс Алисы.",
+  "Отвечай естественно, по-русски, дружелюбно и по существу.",
+  "Обычно ответ должен занимать 1–3 коротких предложения.",
+  "Учитывай переданную историю и явно сохранённые факты пользователя.",
+  "Не выдумывай факты. Если не знаешь — прямо скажи об этом.",
+  "Не используй Markdown, таблицы, заголовки и списки, если пользователь не просит.",
+  "Для актуальных данных используй предоставленные результаты поиска и укажи, если их недостаточно."
+].join(" ");
 
-const MAX_TEXT = 1024;
-const MAX_HISTORY = 12;
-
-const SYSTEM_INSTRUCTION = `
-Ты — голосовой помощник Алисы. Говори по-русски, естественно,
-дружелюбно и кратко, как умная колонка.
-
-Правила:
-- На простые вопросы отвечай обычно одним-двумя предложениями.
-- На приветствие отвечай коротко.
-- Не повторяй вопрос пользователя.
-- Не добавляй вступления и предложения помощи без необходимости.
-- Для сравнений называй главное отличие и практический вывод.
-- Если пользователь просит подробности, объясняй подробнее.
-- Учитывай историю разговора, но не выдумывай факты.
-- Не используй Markdown, таблицы и сложные списки.
-- Для новостей указывай главное событие и его значение.
-- Не выдавай старые сведения за последние новости.
-- Если данных недостаточно, честно сообщи об этом.
-`.trim();
-
-const SEARCH_INSTRUCTION = `
-Ты готовишь короткий устный ответ для умной колонки Алисы.
-Используй предоставленные результаты поиска, а не свои догадки.
-
-Правила:
-- Отвечай по-русски, связно и естественно.
-- Не зачитывай результаты поиска по номерам и не перечисляй
-  подряд названия сайтов.
-- Объедини информацию в короткую выжимку с главным смыслом.
-- Для новостей назови 1–3 важных события и объясни, что произошло.
-- Не называй новость последней, если дата или актуальность не подтверждена.
-- Для погоды сообщи именно запрошенный населённый пункт,
-  температуру, ощущения или осадки, если они есть в результатах.
-- Не подменяй погоду в указанном населённом пункте погодой в регионе.
-- Для спортивных результатов назови матч, участников и результат,
-  только если эти сведения присутствуют в источниках.
-- Не придумывай температуру, даты, результаты, цены и факты.
-- Если результаты не позволяют уверенно ответить, скажи об этом.
-- Обычно достаточно 1–3 коротких предложений.
-- Не используй Markdown, нумерацию и вступления.
-`.trim();
-
-function cleanText(value, max = MAX_TEXT) {
+function clean(value, max = MAX_ALICE_TEXT) {
   return String(value ?? "")
     .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
     .trim()
     .slice(0, max);
 }
 
-function getRemainingTime(startTime) {
-  return Math.max(
-    0,
-    TOTAL_BUDGET_MS - (Date.now() - startTime)
+function fitAliceText(value) {
+  const text = clean(value, 5000);
+  if (!text) return "Не удалось подготовить ответ. Попробуйте ещё раз.";
+  if (text.length <= MAX_ALICE_TEXT) return text;
+
+  const cut = text.slice(0, MAX_ALICE_TEXT - 1);
+  const sentenceEnd = Math.max(
+    cut.lastIndexOf(". "),
+    cut.lastIndexOf("! "),
+    cut.lastIndexOf("? ")
   );
-}
 
-function getHistory(body) {
-  const history =
-    body?.state?.session?.history ??
-    body?.session_state?.history ??
-    [];
-
-  if (!Array.isArray(history)) return [];
-
-  return history
-    .filter(
-      item =>
-        item &&
-        (item.role === "user" || item.role === "model") &&
-        typeof item.text === "string" &&
-        item.text.trim()
-    )
-    .slice(-MAX_HISTORY)
-    .map(item => ({
-      role: item.role,
-      text: cleanText(item.text, 800)
-    }));
-}
-
-function fitMemoryFacts(facts) {
-  const result = [];
-
-  for (const value of facts.slice(-12)) {
-    const fact = cleanText(value, 120);
-    if (!fact) continue;
-
-    const candidate = [...result, fact];
-
-    // Храним запас до лимита Яндекс Диалогов в 1 КБ.
-    if (
-      Buffer.byteLength(
-        JSON.stringify({ memory: { facts: candidate } }),
-        "utf8"
-      ) > 850
-    ) {
-      continue;
-    }
-
-    result.push(fact);
+  if (sentenceEnd > 250) {
+    return cut.slice(0, sentenceEnd + 1).trim();
   }
 
-  return result;
+  const space = cut.lastIndexOf(" ");
+  return (space > 200 ? cut.slice(0, space) : cut).trim() + "…";
 }
 
-function getUserMemory(body) {
+function safeHistory(value) {
+  if (!Array.isArray(value)) return [];
+
+  const result = [];
+
+  for (const item of value.slice(-MAX_HISTORY * 2)) {
+    if (
+      !item ||
+      !["user", "model"].includes(item.role) ||
+      typeof item.text !== "string"
+    ) continue;
+
+    const text = clean(item.text, 700);
+    if (!text) continue;
+
+    const entry = { role: item.role, parts: [{ text }] };
+    const previous = result[result.length - 1];
+
+    if (previous && previous.role === entry.role) {
+      previous.parts[0].text += "\n" + text;
+    } else {
+      result.push(entry);
+    }
+  }
+
+  while (result.length && result[0].role !== "user") {
+    result.shift();
+  }
+
+  return result.slice(-MAX_HISTORY);
+}
+
+function getMemory(body) {
   const facts = body?.state?.user?.memory?.facts;
 
   if (!Array.isArray(facts)) return [];
 
-  return fitMemoryFacts(
-    facts.filter(
-      item => typeof item === "string" && item.trim()
-    )
-  );
+  return facts
+    .filter(x => typeof x === "string")
+    .map(x => clean(x, 120).replace(/^[\s,.:;—-]+/, ""))
+    .filter(Boolean)
+    .slice(-10);
 }
 
-function getMemoryCommand(text) {
-  const remember = text.match(
-    /^(?:алиса[, ]*)?(?:запомни|запомни пожалуйста)\s*(?:,?\s*что\s*)?(.+)$/i
-  );
-
-  if (remember) {
-    const fact = cleanText(
-      remember[1]
-        .replace(/^[\s,.:;—-]+/, "")
-        .replace(/[.!?]+$/, ""),
-      120
-    );
-
-    if (fact && !/^(это|всё|ничего)$/i.test(fact)) {
-      return { type: "remember", fact };
-    }
-  }
-
-  const forget = text.match(
-    /^(?:алиса[, ]*)?(?:забудь|удали из памяти|не запоминай)\s*(?:,?\s*)?(.*)$/i
-  );
-
-  if (forget) {
-    return {
-      type: "forget",
-      target: cleanText(
-        forget[1].replace(/[.!?]+$/, ""),
-        180
-      )
-    };
-  }
-
-  return null;
-}
-
-function normalizeFact(value) {
-  return cleanText(value, 180)
+function normalizeFact(s) {
+  return clean(s, 180)
     .toLocaleLowerCase("ru-RU")
     .replace(/[.,!?;:]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function memoryCommandResult(command, memory) {
+function parseMemoryCommand(text) {
+  let m = text.match(
+    /^(?:алиса[, ]*)?запомни(?: пожалуйста)?(?:\s*,?\s*(?:что\s*)?)?(.+)$/i
+  );
+
+  if (m) {
+    const fact = clean(m[1])
+      .replace(/^[\s,.:;—-]+/, "")
+      .replace(/[.!?]+$/, "");
+
+    if (fact) {
+      return { type: "remember", fact: clean(fact, 120) };
+    }
+  }
+
+  m = text.match(
+    /^(?:алиса[, ]*)?(?:забудь|удали из памяти|не запоминай)\s*(.*)$/i
+  );
+
+  if (m) {
+    return {
+      type: "forget",
+      target: clean(m[1]).replace(/[.!?]+$/, "")
+    };
+  }
+
+  if (/^(?:что ты помнишь|что ты обо мне помнишь|что запомнила)\??$/i.test(text.trim())) {
+    return { type: "list" };
+  }
+
+  return null;
+}
+
+function fitFacts(facts) {
+  const out = [];
+
+  for (const f of facts.slice(-12)) {
+    const fact = clean(f, 120).replace(/^[\s,.:;—-]+/, "");
+
+    if (!fact || out.some(x => normalizeFact(x) === normalizeFact(fact))) {
+      continue;
+    }
+
+    const test = [...out, fact];
+
+    if (
+      Buffer.byteLength(
+        JSON.stringify({ memory: { facts: test } }),
+        "utf8"
+      ) <= 850
+    ) {
+      out.push(fact);
+    }
+  }
+
+  return out;
+}
+
+function memoryResponse(command, oldFacts) {
+  let facts = fitFacts(oldFacts);
+
   if (command.type === "remember") {
-    const normalized = normalizeFact(command.fact);
-
-    const facts = memory.filter(
-      item => normalizeFact(item) !== normalized
-    );
-
-    facts.push(command.fact);
+    facts = fitFacts([
+      ...facts.filter(
+        x => normalizeFact(x) !== normalizeFact(command.fact)
+      ),
+      command.fact
+    ]);
 
     return {
-      facts: fitMemoryFacts(facts),
-      answer: `Хорошо, запомнила: ${command.fact}.`,
-      changed: true
+      text: `Хорошо, запомнила: ${command.fact}.`,
+      facts,
+      update: true
+    };
+  }
+
+  if (command.type === "list") {
+    return {
+      text: facts.length
+        ? `Я помню: ${facts.join("; ")}.`
+        : "Пока у меня нет сохранённых фактов.",
+      facts,
+      update: false
     };
   }
 
   if (!command.target) {
     return {
-      facts: memory,
-      answer: memory.length
-        ? `Я помню: ${memory.join("; ")}. Чтобы удалить факт, скажи, что именно забыть.`
+      text: facts.length
+        ? `Я помню: ${facts.join("; ")}. Чтобы удалить факт, скажи, что именно забыть.`
         : "Пока у меня нет сохранённых фактов.",
-      changed: false
+      facts,
+      update: false
     };
   }
 
   const target = normalizeFact(command.target);
-  const targetWords = target
-    .split(" ")
-    .filter(word => word.length > 2);
+  const words = target.split(" ").filter(x => x.length > 2);
 
-  const kept = memory.filter(fact => {
-    const normalized = normalizeFact(fact);
-
+  const kept = facts.filter(f => {
+    const n = normalizeFact(f);
     return !(
-      normalized.includes(target) ||
-      target.includes(normalized) ||
-      (
-        targetWords.length > 0 &&
-        targetWords.every(
-          word => normalized.includes(word)
-        )
-      )
+      n.includes(target) ||
+      (words.length && words.every(w => n.includes(w)))
     );
   });
 
-  const changed = kept.length !== memory.length;
+  const changed = kept.length !== facts.length;
 
   return {
-    facts: fitMemoryFacts(kept),
-    answer: changed
+    text: changed
       ? "Хорошо, удалила это из памяти."
       : "Не нашла такой факт в сохранённой памяти.",
-    changed
+    facts: kept,
+    update: changed
   };
 }
 
-function buildHistory(history, userText, answer) {
-  const result = [...history];
-  const last = result[result.length - 1];
-
-  // Не добавляем запрос повторно, если он уже есть в истории.
-  if (
-    !last ||
-    last.role !== "user" ||
-    last.text !== userText
-  ) {
-    result.push({
-      role: "user",
-      text: userText
-    });
-  }
-
-  result.push({
-    role: "model",
-    text: cleanText(answer)
-  });
-
-  return result.slice(-MAX_HISTORY);
-}
-
-function aliceResponse(
-  res,
-  text,
-  history = [],
-  userStateUpdate = null
-) {
-  const safeText =
-    cleanText(text) ||
-    "Не удалось подготовить ответ. Попробуйте ещё раз.";
-
+function response(res, text, history, userStateUpdate) {
   const payload = {
     version: "1.0",
     response: {
-      text: safeText,
+      text: fitAliceText(text),
       end_session: false
     },
     session_state: {
-      history: history.slice(-MAX_HISTORY)
+      history: Array.isArray(history)
+        ? history.slice(-MAX_HISTORY * 2)
+        : []
     }
   };
 
@@ -275,405 +235,375 @@ function aliceResponse(
   return res.status(200).json(payload);
 }
 
-function isWeatherIntent(text) {
-  return /погод\w*|температур\w*|сколько градусов|будет ли дождь|идёт ли дождь|осадки/i
-    .test(text);
+function buildHistory(history, userText, answer) {
+  const h = Array.isArray(history)
+    ? history.map(x => ({
+        role: x.role,
+        text: clean(x.text, 700)
+      }))
+    : [];
+
+  const last = h[h.length - 1];
+
+  if (!last || last.role !== "user" || last.text !== userText) {
+    h.push({ role: "user", text: clean(userText, 700) });
+  }
+
+  h.push({ role: "model", text: clean(answer, 700) });
+
+  return h.slice(-MAX_HISTORY * 2);
 }
 
-function isNewsIntent(text) {
-  return /последн\w*\s+новост\w*|новост\w*|что произошло|что случилось|что нового|свеж\w*\s+новост\w*|события в мире/i
-    .test(text);
+function isWeather(text) {
+  return /погод\w*|температур\w*|сколько градусов|будет ли дождь|осадки/i.test(text);
 }
 
-function isSportsIntent(text) {
-  return /кто выиграл|кто победил|результат\w*\s+матч|сч[её]т\s+матч|последн\w*\s+матч|матч\w*\s+(сегодня|вчера)|футбол\w*.*(сегодня|вчера|сч[её]т|матч)|хокке\w*.*(сегодня|вчера|сч[её]т|матч)|спортивн\w*\s+новост/i
-    .test(text);
+function isNews(text) {
+  return /новост\w*|что произошло|что случилось|события в мире/i.test(text);
 }
 
-function isSearchIntent(text) {
+function isSports(text) {
+  return /кто выиграл|кто победил|результат\w* матч|сч[её]т матч|последн\w* матч|футбол.*(сегодня|вчера|сч[её]т|матч)|хокке.*(сегодня|вчера|сч[её]т|матч)/i.test(text);
+}
+
+function isSearch(text) {
   return (
-    isWeatherIntent(text) ||
-    isNewsIntent(text) ||
-    isSportsIntent(text) ||
-    /(найди|найти|поищи|поиск|в интернете|актуальн\w*|курс валют|цена сегодня)/i
-      .test(text)
+    isWeather(text) ||
+    isNews(text) ||
+    isSports(text) ||
+    /(найди|найти|поищи|в интернете|актуальн\w*|курс валют|цена сегодня|последняя информация)/i.test(text)
   );
 }
 
-function extractSearchQuery(text) {
-  const original = cleanText(text, 180);
+function searchQuery(text) {
+  if (isWeather(text)) {
+    const match = text.match(
+      /(?:в|для|по)\s+([\p{L}-]+(?:\s+[\p{L}-]+){0,2})/iu
+    );
 
-  if (isWeatherIntent(original)) {
-    // Сохраняем название населённого пункта из исходного запроса.
-    const location = original
-      .replace(/^(?:алиса[, ]*)?/i, "")
-      .replace(/^(?:какая|какая сейчас|скажи|расскажи|узнай)\s+/i, "")
-      .replace(/^погод[ауеы]?\s*/i, "")
-      .replace(/\s+(?:сегодня|сейчас|завтра|на неделю|на сегодня).*$/i, "")
-      .trim();
+    const location = match?.[1] || "";
 
     return location
-      ? `погода ${location} сегодня температура осадки прогноз`
-      : "погода сегодня температура осадки прогноз";
+      ? `погода ${location} сегодня температура осадки`
+      : `${text} погода температура осадки`;
   }
 
-  if (isSportsIntent(original)) {
-    return `${original} последний результат матча`;
+  if (isNews(text)) {
+    return `${text} последние новости за 24 часа дата`;
   }
 
-  if (isNewsIntent(original)) {
-    return `${original} новости за последние 24 часа дата публикации`;
+  if (isSports(text)) {
+    return `${text} результат матча`;
   }
 
-  return original
-    .replace(
-      /^(?:алиса[, ]*)?(?:найди|найти|поищи|поиск|скажи|расскажи|покажи)\s*/i,
+  return clean(
+    text.replace(
+      /^(?:алиса[, ]*)?(?:найди|найти|поищи|расскажи|скажи)\s*/i,
       ""
-    )
-    .trim() || original;
+    ),
+    180
+  ) || text;
 }
 
-async function fetchJsonWithTimeout(
-  url,
-  options,
-  timeoutMs
-) {
+async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
 
   const timer = setTimeout(
     () => controller.abort(),
-    Math.max(1, timeoutMs)
+    Math.max(100, timeoutMs)
   );
 
   try {
-    const response = await fetch(url, {
+    const r = await fetch(url, {
       ...options,
       signal: controller.signal
     });
 
-    const rawText = await response.text();
+    const raw = await r.text();
     let data = {};
 
     try {
-      data = rawText ? JSON.parse(rawText) : {};
-    } catch {
-      data = {};
-    }
+      data = raw ? JSON.parse(raw) : {};
+    } catch {}
 
-    return { response, data };
+    return { r, data };
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function searchWeb(query, timeoutMs) {
-  const apiKey = process.env.SERPER_API_KEY;
+async function gemini(text, history, memory, timeoutMs) {
+  const key = process.env.GEMINI_API_KEY;
 
-  if (!apiKey) {
+  if (!key) throw new Error("MISSING_GEMINI_API_KEY");
+  if (timeoutMs < 300) throw new Error("NO_TIME_LEFT");
+
+  const contents = safeHistory(history);
+  const last = contents[contents.length - 1];
+
+  if (!last || last.role !== "user" || last.parts[0].text !== text) {
+    const entry = { role: "user", parts: [{ text }] };
+
+    if (contents.length && contents[contents.length - 1].role === "user") {
+      contents[contents.length - 1].parts[0].text += "\n" + text;
+    } else {
+      contents.push(entry);
+    }
+  }
+
+  const prompt = SYSTEM_PROMPT + (
+    memory.length
+      ? " Сохранённые факты пользователя: " + memory.join("; ") + "."
+      : ""
+  );
+
+  let result;
+
+  try {
+    result = await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": key
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: prompt }]
+          },
+          contents: contents.slice(-MAX_HISTORY),
+          generationConfig: {
+            temperature: 0.4,
+            maxOutputTokens: 180
+          }
+        })
+      },
+      timeoutMs
+    );
+  } catch (e) {
+    console.error("Gemini fetch failed:", e?.name, e?.message);
+    throw new Error(
+      e?.name === "AbortError"
+        ? "GEMINI_TIMEOUT"
+        : "GEMINI_NETWORK_ERROR"
+    );
+  }
+
+  if (!result.r.ok) {
+    console.error(
+      "Gemini HTTP error:",
+      result.r.status,
+      JSON.stringify(result.data?.error || {}).slice(0, 600)
+    );
+
+    if (result.r.status === 400) throw new Error("GEMINI_BAD_REQUEST");
+    if (result.r.status === 401 || result.r.status === 403) {
+      throw new Error("GEMINI_KEY_REJECTED");
+    }
+    if (result.r.status === 429) throw new Error("GEMINI_QUOTA");
+
+    throw new Error("GEMINI_HTTP_" + result.r.status);
+  }
+
+  const answer = (
+    result.data?.candidates?.[0]?.content?.parts || []
+  )
+    .map(p => p.text || "")
+    .join("")
+    .trim();
+
+  if (!answer) {
+    console.error(
+      "Gemini empty response:",
+      JSON.stringify(
+        result.data?.promptFeedback ||
+        result.data?.candidates?.[0]?.finishReason ||
+        {}
+      ).slice(0, 500)
+    );
+
+    throw new Error("GEMINI_EMPTY_RESPONSE");
+  }
+
+  return clean(answer);
+}
+
+async function serper(query, timeoutMs) {
+  const key = process.env.SERPER_API_KEY;
+
+  if (!key) {
     console.error("SERPER_API_KEY is missing");
     return null;
   }
 
-  if (timeoutMs <= 0) return null;
-
   try {
-    const newsSearch = isNewsIntent(query);
+    const news = isNews(query);
 
-    const endpoint = newsSearch
-      ? "https://google.serper.dev/news"
-      : "https://google.serper.dev/search";
-
-    const { response, data } = await fetchJsonWithTimeout(
-      endpoint,
+    const { r, data } = await fetchJson(
+      `https://google.serper.dev/${news ? "news" : "search"}`,
       {
         method: "POST",
         headers: {
-          "X-API-KEY": apiKey,
+          "X-API-KEY": key,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
           q: query,
           gl: "ru",
           hl: "ru",
-          num: newsSearch ? 6 : 5,
-          ...(newsSearch ? { tbs: "qdr:d" } : {})
+          num: 5,
+          ...(news ? { tbs: "qdr:d" } : {})
         })
       },
       timeoutMs
     );
 
-    if (!response.ok) {
+    if (!r.ok) {
       console.error(
-        "Serper HTTP status:",
-        response.status
+        "Serper HTTP error:",
+        r.status,
+        JSON.stringify(data).slice(0, 400)
       );
       return null;
     }
 
-    const results = [];
+    const arr = news ? data.news : data.organic;
+
+    const results = (Array.isArray(arr) ? arr : [])
+      .slice(0, 4)
+      .map(x => ({
+        title: clean(x.title, 160),
+        date: clean(x.date, 60),
+        snippet: clean(x.snippet, 260)
+      }))
+      .filter(x => x.title || x.snippet);
 
     if (data.answerBox?.answer) {
-      results.push({
-        title: "Прямой ответ",
-        snippet: cleanText(data.answerBox.answer, 350),
-        date: ""
+      results.unshift({
+        title: "Ответ",
+        date: "",
+        snippet: clean(data.answerBox.answer, 260)
       });
     } else if (data.answerBox?.snippet) {
-      results.push({
-        title: "Краткий ответ",
-        snippet: cleanText(data.answerBox.snippet, 350),
-        date: ""
+      results.unshift({
+        title: "Ответ",
+        date: "",
+        snippet: clean(data.answerBox.snippet, 260)
       });
-    }
-
-    const organic = newsSearch
-      ? (Array.isArray(data.news) ? data.news : [])
-      : (Array.isArray(data.organic) ? data.organic : []);
-
-    for (
-      const item of organic.slice(0, newsSearch ? 6 : 5)
-    ) {
-      const title = cleanText(item?.title, 180);
-      const snippet = cleanText(item?.snippet, 350);
-      const date = cleanText(item?.date, 80);
-
-      if (title || snippet) {
-        results.push({
-          title,
-          snippet,
-          date
-        });
-      }
     }
 
     return results.length ? results : null;
-  } catch (error) {
-    console.error(
-      "Search error:",
-      error?.name || "Error",
-      cleanText(error?.message, 160)
-    );
-
+  } catch (e) {
+    console.error("Serper fetch failed:", e?.name, e?.message);
     return null;
   }
 }
 
-function formatSearchResults(results) {
-  return results
-    .map((item, index) => {
-      const parts = [
-        `Источник ${index + 1}`,
-        item.title,
-        item.date ? `Дата: ${item.date}` : "",
-        item.snippet
-      ].filter(Boolean);
-
-      return parts.join(". ");
-    })
-    .join("\n")
-    .slice(0, 3800);
-}
-
-async function askGemini(
-  userText,
-  history,
-  timeoutMs,
-  searchResults = null,
-  userMemory = []
-) {
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey) {
-    console.error("GEMINI_API_KEY is missing");
-    return null;
-  }
-
-  if (timeoutMs <= 0) return null;
-
-  const recentHistory = history.slice(-8);
-
-  const contents = recentHistory.map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
-
-  if (searchResults) {
-    contents.push({
-      role: "user",
-      parts: [{
-        text:
-          `Запрос пользователя: ${userText}\n\n` +
-          `Результаты актуального поиска:\n${searchResults}\n\n` +
-          "Составь короткий ответ строго по найденным сведениям."
-      }]
-    });
-  } else {
-    const last = contents[contents.length - 1];
-
-    // Текущий запрос добавляем ровно один раз.
-    if (
-      !last ||
-      last.role !== "user" ||
-      last.parts?.[0]?.text !== userText
-    ) {
-      contents.push({
-        role: "user",
-        parts: [{ text: userText }]
-      });
-    }
-  }
-
-  // Gemini ожидает чередование user/model, а не две user-реплики подряд.
-  const normalizedContents = [];
-
-  for (const item of contents) {
-    const previous =
-      normalizedContents[normalizedContents.length - 1];
-
-    if (previous?.role === item.role) {
-      if (item.role === "user") {
-        previous.parts[0].text +=
-          "\n" + item.parts.map(p => p.text || "").join("\n");
-      } else {
-        normalizedContents.push(item);
-      }
-    } else {
-      normalizedContents.push(item);
-    }
-  }
-
-  try {
-    const { response, data } = await fetchJsonWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{
-              text:
-                (searchResults
-                  ? SEARCH_INSTRUCTION
-                  : SYSTEM_INSTRUCTION) +
-                (userMemory.length
-                  ? "\n\nСохранённые факты, которые пользователь явно просил запомнить. Используй их, когда вопрос относится к ним; не выдумывай другие факты: " +
-                    userMemory.join("; ")
-                  : "")
-            }]
-          },
-          contents: normalizedContents.slice(-8),
-          generationConfig: {
-            temperature: 0.4,
-            maxOutputTokens: searchResults ? 180 : 120,
-            thinkingConfig: {
-              thinkingLevel: "MINIMAL"
-            }
-          }
-        })
-      },
-      timeoutMs
-    );
-
-    if (!response.ok) {
-      console.error(
-        "Gemini HTTP status:",
-        response.status,
-        cleanText(data?.error?.message, 220)
-      );
-
-      return null;
-    }
-
-    const answer = data?.candidates?.[0]?.content?.parts
-      ?.map(part => part.text || "")
-      .join("")
-      .trim();
-
-    if (!answer) {
-      console.error("Gemini returned no text");
-      return null;
-    }
-
-    return cleanText(answer);
-  } catch (error) {
-    console.error(
-      "Gemini request error:",
-      error?.name || "Error",
-      cleanText(error?.message, 160)
-    );
-
-    return null;
-  }
-}
-
-function fallbackSearchAnswer(
-  results,
-  weather,
-  news,
-  sports
-) {
+function searchFallback(results, kind) {
   if (!results?.length) {
-    if (weather) {
-      return "Не удалось получить свежий прогноз для этого населённого пункта. Попробуйте ещё раз.";
+    if (kind === "weather") {
+      return "Не удалось получить свежий прогноз погоды. Попробуйте ещё раз чуть позже.";
     }
 
-    if (sports) {
+    if (kind === "news") {
+      return "Не удалось получить свежие новости. Попробуйте ещё раз чуть позже.";
+    }
+
+    if (kind === "sports") {
       return "Не удалось найти подтверждённый результат матча. Уточните команды или турнир.";
     }
 
-    if (news) {
-      return "Сейчас не удалось получить свежие новости. Попробуйте ещё раз немного позже.";
-    }
-
-    return "Сейчас не удалось найти информацию в интернете. Попробуйте ещё раз.";
+    return "Поиск сейчас не вернул результатов. Попробуйте сформулировать запрос иначе.";
   }
 
-  const snippets = results
-    .map(item => {
-      const parts = [
-        item.title,
-        item.date,
-        item.snippet
-      ].filter(Boolean);
+  const lines = results
+    .slice(0, 3)
+    .map(x => [x.title, x.date, x.snippet].filter(Boolean).join(". "));
 
-      return parts.join(". ");
-    })
-    .filter(Boolean);
+  return fitAliceText(lines.join(". "));
+}
 
-  if (weather) {
-    return cleanText(
-      snippets.slice(0, 2).join(". "),
-      MAX_TEXT
-    );
+function localReply(text) {
+  const t = text
+    .toLocaleLowerCase("ru-RU")
+    .trim()
+    .replace(/[!.?]+$/, "");
+
+  if (/^(привет|приветик|здравствуй|здравствуйте|доброе утро|добрый день|добрый вечер|хай|салют|алиса привет)$/i.test(t)) {
+    return "Привет! Рада тебя слышать. Что хочешь узнать?";
   }
 
-  if (sports) {
-    return cleanText(
-      snippets.slice(0, 2).join(". "),
-      MAX_TEXT
-    );
+  if (/^(как дела|как у тебя дела|ты как)$/i.test(t)) {
+    return "Всё хорошо, спасибо! Готова помочь. А у тебя как?";
   }
 
-  return cleanText(
-    snippets.slice(0, 3).join(". "),
-    MAX_TEXT
-  );
+  if (/^(спасибо|спасибо большое|благодарю)$/i.test(t)) {
+    return "Пожалуйста!";
+  }
+
+  if (/^(расскажи анекдот|анекдот|расскажи шутку|пошути|скажи шутку)$/i.test(t)) {
+    const jokes = [
+      "Программист звонит в библиотеку: «У вас есть книги про паранойю?» Библиотекарь шёпотом отвечает: «Они прямо за вами».",
+      "Покупатель спрашивает: «У вас есть компьютер, который никогда не зависает?» Продавец: «Есть. Но он уже три дня не отвечает».",
+      "Учитель спрашивает: «Почему опоздал?» Ученик: «На дороге знак был: “Осторожно, дети!” Вот я и шёл осторожно»."
+    ];
+
+    return jokes[Math.floor(Math.random() * jokes.length)];
+  }
+
+  if (/^(кто ты|как тебя зовут|ты кто)$/i.test(t)) {
+    return "Я голосовой помощник Алисы с подключённой нейросетью. Могу отвечать на вопросы и искать актуальную информацию.";
+  }
+
+  return null;
+}
+
+function errorText(error) {
+  switch (error?.message) {
+    case "MISSING_GEMINI_API_KEY":
+      return "На сервере не задан GEMINI_API_KEY. Проверь переменные окружения Vercel.";
+
+    case "GEMINI_KEY_REJECTED":
+      return "Gemini отклонила API-ключ. Проверь GEMINI_API_KEY в Vercel.";
+
+    case "GEMINI_QUOTA":
+      return "У Gemini закончился доступный лимит запросов. Попробуй позже.";
+
+    case "GEMINI_BAD_REQUEST":
+      return "Gemini отклонила формат запроса. Ошибка записана в лог Vercel.";
+
+    case "GEMINI_TIMEOUT":
+    case "NO_TIME_LEFT":
+      return "Нейросеть не успела ответить за отведённое время. Попробуй ещё раз.";
+
+    case "GEMINI_NETWORK_ERROR":
+      return "Сервер не смог соединиться с Gemini. Попробуй ещё раз.";
+
+    case "GEMINI_EMPTY_RESPONSE":
+      return "Gemini не вернула текстовый ответ. Попробуй задать вопрос иначе.";
+
+    default:
+      return "Не удалось получить ответ от нейросети. Код ошибки записан в лог Vercel.";
+  }
 }
 
 export default async function handler(req, res) {
-  const startTime = Date.now();
-
-  res.setHeader("Cache-Control", "no-store");
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: true,
+      service: "alice-voice",
+      model: MODEL
+    });
+  }
 
   if (req.method !== "POST") {
-    return aliceResponse(
-      res,
-      "Я готова отвечать на вопросы. Спросите, что вас интересует."
-    );
+    res.setHeader("Allow", "GET, POST");
+    return res.status(405).json({ error: "Method not allowed" });
   }
+
+  const started = Date.now();
+  const remaining = () => TOTAL_BUDGET_MS - (Date.now() - started);
 
   let body = req.body;
 
@@ -685,122 +615,114 @@ export default async function handler(req, res) {
     }
   }
 
-  if (!body || typeof body !== "object") {
-    body = {};
-  }
+  if (!body || typeof body !== "object") body = {};
 
-  const request = body.request || {};
-
-  const userText = cleanText(
-    request.original_utterance || request.command || ""
+  const text = clean(
+    body?.request?.original_utterance ||
+    body?.request?.command ||
+    "",
+    500
   );
 
-  const history = getHistory(body);
-  const userMemory = getUserMemory(body);
+  const oldHistory = Array.isArray(body?.state?.session?.history)
+    ? body.state.session.history
+    : [];
 
-  if (!userText) {
-    return aliceResponse(
+  const history = oldHistory
+    .filter(x => x && ["user", "model"].includes(x.role) && typeof x.text === "string")
+    .slice(-MAX_HISTORY * 2)
+    .map(x => ({ role: x.role, text: clean(x.text, 700) }));
+
+  const memory = getMemory(body);
+
+  if (!text) {
+    return response(
       res,
-      "Не расслышала вопрос. Повторите, пожалуйста.",
+      "Привет! Задай вопрос, и я постараюсь помочь.",
       history
     );
   }
 
-  const memoryCommand = getMemoryCommand(userText);
+  const memCommand = parseMemoryCommand(text);
 
-  if (memoryCommand) {
-    const result = memoryCommandResult(
-      memoryCommand,
-      userMemory
-    );
+  if (memCommand) {
+    const result = memoryResponse(memCommand, memory);
 
-    const update = result.changed
+    const update = result.update
       ? { memory: { facts: result.facts } }
       : null;
 
-    return aliceResponse(
+    return response(
       res,
-      result.answer,
-      buildHistory(history, userText, result.answer),
+      result.text,
+      buildHistory(history, text, result.text),
       update
     );
   }
 
-  const weather = isWeatherIntent(userText);
-  const news = isNewsIntent(userText);
-  const sports = isSportsIntent(userText);
+  const local = localReply(text);
+
+  if (local) {
+    return response(
+      res,
+      local,
+      buildHistory(history, text, local)
+    );
+  }
 
   try {
-    if (isSearchIntent(userText)) {
-      const query = extractSearchQuery(userText);
+    if (isSearch(text)) {
+      const query = searchQuery(text);
+      console.log("Search query:", query);
 
-      console.log("Search request:", query);
-
-      const searchTimeout = Math.min(
-        SERPER_TIMEOUT_MS,
-        getRemainingTime(startTime) - 300
-      );
-
-      const results = await searchWeb(
+      const results = await serper(
         query,
-        Math.max(0, searchTimeout)
+        Math.min(
+          SERPER_TIMEOUT_MS,
+          Math.max(100, remaining() - 500)
+        )
       );
 
-      // Не запускаем Gemini вторым запросом после Serper:
-      // два внешних API подряд часто не укладываются
-      // в лимит Яндекс Диалогов (4,5 секунды).
-      // Формируем короткий ответ непосредственно по результатам поиска.
-      const answer = fallbackSearchAnswer(
-        results,
-        weather,
-        news,
-        sports
-      );
+      const kind = isWeather(text)
+        ? "weather"
+        : isNews(text)
+          ? "news"
+          : isSports(text)
+            ? "sports"
+            : "general";
 
-      return aliceResponse(
+      const answer = searchFallback(results, kind);
+
+      return response(
         res,
         answer,
-        buildHistory(history, userText, answer)
+        buildHistory(history, text, answer)
       );
     }
 
-    const remaining = getRemainingTime(startTime);
-
-    const answer = await askGemini(
-      userText,
+    const answer = await gemini(
+      text,
       history,
-      Math.min(
-        GEMINI_TIMEOUT_MS,
-        Math.max(0, remaining - 200)
-      ),
-      null,
-      userMemory
+      memory,
+      Math.min(GEMINI_TIMEOUT_MS, remaining() - 250)
     );
 
-    const finalAnswer =
-      answer ||
-      "Нейросеть временно не ответила. Попробуйте повторить вопрос.";
-
-    return aliceResponse(
+    return response(
       res,
-      finalAnswer,
-      buildHistory(history, userText, finalAnswer)
+      answer,
+      buildHistory(history, text, answer)
     );
   } catch (error) {
-    console.error(
-      "Webhook error:",
-      error?.name || "Error",
-      cleanText(error?.message || "Unknown error", 200)
-    );
+    console.error("Alice handler error:", error?.message || error);
 
-    const message = isSearchIntent(userText)
-      ? "Сейчас не удалось получить ответ. Попробуйте ещё раз."
-      : "Нейросеть временно не ответила. Попробуйте повторить вопрос.";
+    const message = errorText(error);
 
-    return aliceResponse(
+    return response(
       res,
       message,
-      buildHistory(history, userText, message)
+      buildHistory(history, text, message)
     );
   }
 }
+
+export { clean, safeHistory, parseMemoryCommand, localReply, isSearch };
