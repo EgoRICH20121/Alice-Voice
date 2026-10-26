@@ -17,10 +17,36 @@ const response = (data, status = 200, contentType = "application/json") =>
     headers: { "content-type": contentType }
   });
 
-test("GDELT news search returns real article fields and requests the documented DOC API", async () => {
-  let requested;
+test("existing Serper provider is tried first and returns real normalized news", async () => {
+  let gdeltCalled = false;
   const results = await searchNews("новости про озу", {
     timeoutMs: 1900,
+    fallback: async budget => {
+      assert.ok(budget > 0 && budget <= 1300);
+      return [{
+        title: "Новый стандарт памяти",
+        url: "https://example.com/news/ram",
+        date: "Сегодня",
+        snippet: "Производители представили новый стандарт.",
+        source: "example.com"
+      }];
+    },
+    fetchImpl: async () => {
+      gdeltCalled = true;
+      return response({ articles: [article()] });
+    }
+  });
+
+  assert.equal(gdeltCalled, false);
+  assert.equal(results[0].title, "Новый стандарт памяти");
+  assert.equal(results[0].url, "https://example.com/news/ram");
+});
+
+test("empty Serper results fall back to independent GDELT search", async () => {
+  let requested;
+  const results = await searchNews("новости про ОЗУ", {
+    timeoutMs: 1900,
+    fallback: async () => [],
     fetchImpl: async (url, options) => {
       requested = { url: new URL(url), options };
       return response({ articles: [article()] });
@@ -41,10 +67,21 @@ test("GDELT news search returns real article fields and requests the documented 
   assert.equal(results.searchPeriod, "day");
 });
 
-test("empty daily results expand to a seven-day GDELT query", async () => {
+test("Serper network failure falls back to GDELT and a successful result is returned", async () => {
+  const results = await searchNews("новости о процессорах", {
+    timeoutMs: 1500,
+    fallback: async () => null,
+    fetchImpl: async () => response({ articles: [article("Новый процессор")] })
+  });
+
+  assert.equal(results[0].title, "Новый процессор");
+});
+
+test("empty daily GDELT results expand to a seven-day query", async () => {
   const periods = [];
   const results = await searchNews("последние новости про видеокарты", {
     timeoutMs: 2100,
+    fallback: async () => null,
     fetchImpl: async url => {
       const u = new URL(url);
       periods.push(u.searchParams.get("timespan"));
@@ -57,40 +94,29 @@ test("empty daily results expand to a seven-day GDELT query", async () => {
   assert.equal(results.searchPeriod, "week");
 });
 
-test("provider HTTP/JSON errors use the independent fallback, not an empty-news answer", async () => {
-  let fallbackCalled = false;
+test("GDELT HTTP/JSON errors do not masquerade as empty news", async () => {
   const results = await searchNews("новости о процессорах", {
     timeoutMs: 1500,
-    fetchImpl: async () => response({ error: "upstream" }, 503),
-    fallback: async budget => {
-      fallbackCalled = true;
-      assert.ok(budget > 0 && budget <= 800);
-      return [{ title: "Новость из резервного источника", url: "https://backup.example/news", source: "backup.example" }];
-    }
+    fallback: async () => null,
+    fetchImpl: async () => response({ error: "upstream" }, 503)
   });
 
-  assert.equal(fallbackCalled, true);
-  assert.equal(results[0].title, "Новость из резервного источника");
+  assert.equal(results, null);
 });
 
-test("a timed-out provider request is bounded and can recover through fallback", async () => {
-  let fallbackCalled = false;
+test("a timed-out GDELT request is bounded and can return an empty result without hanging", async () => {
   const started = Date.now();
   const results = await searchNews("что нового в технологиях", {
     timeoutMs: 600,
+    fallback: async () => null,
     fetchImpl: (_url, options) => new Promise((resolve, reject) => {
       const fail = () => reject(options.signal.reason || new DOMException("aborted", "AbortError"));
       if (options.signal.aborted) return fail();
       options.signal.addEventListener("abort", fail, { once: true });
-    }),
-    fallback: async () => {
-      fallbackCalled = true;
-      return [{ title: "Восстановлено через резервный источник", url: "https://backup.example/1" }];
-    }
+    })
   });
 
-  assert.equal(fallbackCalled, true);
-  assert.equal(results[0].title, "Восстановлено через резервный источник");
+  assert.equal(results, null);
   assert.ok(Date.now() - started < 550, "provider timeout must stay within its assigned budget");
 });
 

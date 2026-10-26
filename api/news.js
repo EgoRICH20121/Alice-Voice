@@ -139,9 +139,9 @@ async function requestGdelt(query, period, timeoutMs, signal, fetchImpl, request
 }
 
 /**
- * Search actual news articles using GDELT DOC 2.0 (public, no API key).
- * GDELT is primary; Serper is an optional independent fallback supplied by caller.
- * The entire chain is bounded by timeoutMs and never treats provider errors as empty results.
+ * If Serper is supplied, try it first because it was the previously working
+ * provider. GDELT is then an independent fallback; it needs no API key.
+ * A single deadline bounds both providers.
  */
 export async function searchNews(query, {
   timeoutMs = 1900,
@@ -154,6 +154,32 @@ export async function searchNews(query, {
   const deadline = started + Math.max(0, timeoutMs);
   const gdeltQuery = buildGdeltQuery(query);
   const remaining = () => deadline - Date.now();
+  let primaryResults = null;
+  let primaryWasValid = false;
+
+  // Prefer the existing Serper integration. Reserve enough time for GDELT
+  // rather than letting the first provider consume the whole Alice deadline.
+  if (typeof fallback === "function" && remaining() >= 650) {
+    const primaryBudget = Math.min(1300, remaining() - MIN_FALLBACK_MS);
+    if (primaryBudget >= 300) {
+      try {
+        const results = await fallback(primaryBudget);
+        if (Array.isArray(results)) {
+          primaryResults = results;
+          primaryWasValid = true;
+          if (results.length) return results;
+        }
+      } catch (error) {
+        console.warn("Primary news provider failed:", {
+          requestId, errorName: error?.name
+        });
+      }
+    }
+  }
+
+  if (remaining() < 100) {
+    return primaryWasValid ? primaryResults : null;
+  }
 
   const first = await requestGdelt(
     gdeltQuery, "day", Math.min(REQUEST_TIMEOUT_MS, remaining() - MIN_FALLBACK_MS),
@@ -162,8 +188,6 @@ export async function searchNews(query, {
 
   if (first.ok && first.results.length) return first.results;
 
-  // Empty one-day results get one wider GDELT query; provider failures can go
-  // directly to the independent Serper fallback instead of waiting twice.
   if (first.ok && first.results.length === 0 && remaining() >= 550) {
     const weekly = await requestGdelt(
       gdeltQuery, "week", Math.min(650, remaining() - MIN_FALLBACK_MS),
@@ -172,28 +196,15 @@ export async function searchNews(query, {
     if (weekly.ok && weekly.results.length) return weekly.results;
     if (weekly.ok) {
       weekly.results.searchPeriod = "week";
-      if (!fallback || remaining() < MIN_FALLBACK_MS) return weekly.results;
+      if (primaryWasValid || !fallback || remaining() < MIN_FALLBACK_MS) {
+        return primaryWasValid ? primaryResults : weekly.results;
+      }
     }
   }
 
-  if (typeof fallback === "function" && remaining() >= MIN_FALLBACK_MS - 75) {
-    const fallbackBudget = Math.max(0, Math.min(800, remaining()));
-    console.log("News provider fallback:", {
-      requestId, from: "gdelt", to: "serper",
-      reason: first.reason || "empty_results",
-      timeoutMs: fallbackBudget
-    });
-    try {
-      const results = await fallback(fallbackBudget);
-      if (Array.isArray(results)) return results;
-    } catch (error) {
-      console.warn("News fallback failed:", {
-        requestId, errorName: error?.name, errorMessage: error?.message
-      });
-    }
-  }
-
-  // null means unavailable; [] means provider successfully returned no articles.
+  // If the primary Serper attempt failed, a successful empty GDELT response
+  // is still distinguishable from provider failure.
+  if (primaryWasValid) return primaryResults;
   if (first.ok) return first.results;
   return null;
 }
