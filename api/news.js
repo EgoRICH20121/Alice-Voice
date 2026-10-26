@@ -14,22 +14,22 @@ function clean(value, max = 300) {
 export function buildGdeltQuery(query) {
   const text = clean(query, 180).toLocaleLowerCase("ru-RU")
     .replace(/[«»„“”]/g, '"')
-    .replace(/\b(?:самые\s+)?последние\s+новости\b/giu, " ")
-    .replace(/\bновости\b/giu, " ")
-    .replace(/\b(?:расскажи|скажи|найди|поищи|что нового|про|о|об|по теме)\b/giu, " ")
-    .replace(/\s{2,}/g, " ")
+    .replace(/(?:самые\\s+)?последние\\s+новости/giu, " ")
+    .replace(/новости/giu, " ")
+    .replace(/(?:расскажи|скажи|найди|поищи|что нового|про|о|об|по теме)/giu, " ")
+    .replace(/\\s{2,}/g, " ")
     .trim();
 
-  if (/\b(?:озу|оперативк\w*|оперативн\w* память)\b/iu.test(text)) {
+  if (/(?:^|[^\\p{L}])(?:озу|оперативк[\\p{L}]*|оперативн[\\p{L}]*\\s+памят[\\p{L}]*)(?:$|[^\\p{L}])/iu.test(text)) {
     return '("RAM" OR "DRAM" OR "DDR5" OR "DDR4" OR "оперативная память")';
   }
-  if (/\b(?:видеокарт\w*|графическ\w* карт\w*|gpu)\b/iu.test(text)) {
+  if (/(?:^|[^\\p{L}])(?:видеокарт[\\p{L}]*|графическ[\\p{L}]*\\s+карт[\\p{L}]*|gpu)(?:$|[^\\p{L}])/iu.test(text)) {
     return '("graphics card" OR GPU OR NVIDIA OR AMD)';
   }
-  if (/\b(?:процессор\w*|cpu)\b/iu.test(text)) {
+  if (/(?:^|[^\\p{L}])(?:процессор[\\p{L}]*|cpu)(?:$|[^\\p{L}])/iu.test(text)) {
     return '(CPU OR processor OR процессор OR Intel OR AMD)';
   }
-  if (/\b(?:технолог\w*|техник\w*|искусственн\w* интеллект\w*|ии)\b/iu.test(text)) {
+  if (/(?:^|[^\\p{L}])(?:технолог[\\p{L}]*|техник[\\p{L}]*|искусственн[\\p{L}]*\\s+интеллект[\\p{L}]*|ии)(?:$|[^\\p{L}])/iu.test(text)) {
     return '(technology OR AI OR semiconductor OR технологи*)';
   }
 
