@@ -67,6 +67,10 @@ function router({ serper, gemini }) {
   const impl = async (url, opts) => {
     const u = String(url);
     const body = opts?.body ? JSON.parse(opts.body) : {};
+    if (u.includes("api.gdeltproject.org")) {
+      // These legacy integration cases exercise the independent Serper fallback.
+      throw new Error("simulated GDELT outage");
+    }
     if (u.includes("serper.dev")) {
       log.push({ api: "serper", body });
       return serper(body, u);
@@ -462,6 +466,10 @@ test("11. hanging Gemini still yields a reply well inside the Yandex 4.5 s limit
 test("search intent: no false positives, no searching for what Gemini can answer", () => {
   assert.equal(isSearch("Какая погода в Москве сегодня?"), true);
   assert.equal(isSearch("что нового в мире"), true);
+  assert.equal(isSearch("что нового в технологиях"), true);
+  assert.equal(isSearch("новости про ОЗУ"), true);
+  assert.equal(isSearch("последние новости про видеокарты"), true);
+  assert.equal(isSearch("новости о процессорах"), true);
   assert.equal(isSearch("поищи в интернете характеристики Xeon E3-1220 v2"), true);
   assert.equal(isSearch("курс доллара сегодня"), true);
   assert.equal(isSearch("Погодите, я передумал"), false);
@@ -723,7 +731,7 @@ test("news search with missing SERPER_API_KEY returns unavailable, not an empty-
     const { payload } = await call(turn("последние новости про озу"));
     assert.match(payload.response.text, /Поиск сейчас недоступен/);
     assert.doesNotMatch(payload.response.text, /не нашла/i);
-    assert.equal(f.mock.callCount(), 0);
+    assert.equal(f.mock.callCount(), 1); // GDELT работает без ключа; вызов завершился контролируемой ошибкой в этом тесте
   } finally {
     process.env.SERPER_API_KEY = saved;
     f.mock.restore();
