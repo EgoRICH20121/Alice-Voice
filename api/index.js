@@ -873,7 +873,11 @@ async function serper(query, kind, timeoutMs, signal, requestId) {
     }
     const sampleItemKeys = arr[0] && typeof arr[0] === "object" ? Object.keys(arr[0]).slice(0, 12) : [];
     const results = arr.slice(0, 6).filter(x => x && typeof x === "object").map(x => ({
-      title: clean(x.title, 160), date: clean(x.date, 60), snippet: clean(x.snippet, 300), source: clean(x.source, 60)
+      title: clean(x.title, 160),
+      url: clean(x.link || x.url, 500),
+      date: clean(x.date, 60),
+      snippet: clean(x.snippet, 300),
+      source: clean(x.source || x.domain, 60)
     })).filter(x => x.title || x.snippet);
     console.log("Serper response:", { requestId, stage, status: r.status, durationMs: Date.now() - requestStartedAt, topLevelKeys, rawResultCount: arr.length, normalizedResultCount: results.length, sampleItemKeys });
     const box = data.answerBox;
