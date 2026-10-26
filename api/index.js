@@ -1,3 +1,5 @@
+import { searchNews } from "./news.js";
+
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const FALLBACK_MODEL =
   process.env.GEMINI_FALLBACK_MODEL || "gemini-3.1-flash-lite";
@@ -516,7 +518,7 @@ const WEATHER_RE =
   /(?<![\p{L}])погод(?:а|ы|е|у|ой|ою)(?![\p{L}])|сколько градусов|будет ли (?:дождь|снег)|температур\w* (?:на улице|за окном|воздуха)/iu;
 
 const NEWS_RE =
-  /(?<![\p{L}])новост[\p{L}]*|что (?:произошло|случилось|нового) (?:сегодня|вчера|в мире|в стране)|события (?:в мире|дня)/iu;
+  /(?<![\p{L}])новост[\p{L}]*|что (?:произошло|случилось) (?:сегодня|вчера|в мире|в стране)|что нового(?:\s+(?:сегодня|вчера|в мире|в стране|в технологиях|в технике))?|события (?:в мире|дня)/iu;
 
 const SPORTS_RE =
   /кто выиграл|кто победил|результат\w* матч|сч[её]т матч|последн\w* матч|футбол.*(сегодня|вчера|сч[её]т|матч)|хокке.*(сегодня|вчера|сч[её]т|матч)/iu;
@@ -1338,13 +1340,18 @@ async function processTurn(body, history, remaining, signal, requestId) {
 
     console.log("Search kind:", kind);
 
-    const results = await serper(
-      query,
-      kind,
-      Math.min(kind === "news" ? NEWS_SEARCH_TIMEOUT_MS : SERPER_TIMEOUT_MS, remaining() - SAFETY_MS),
-      signal,
-      requestId
+    const searchTimeoutMs = Math.min(
+      kind === "news" ? NEWS_SEARCH_TIMEOUT_MS : SERPER_TIMEOUT_MS,
+      remaining() - SAFETY_MS
     );
+    const results = kind === "news"
+      ? await searchNews(query, {
+          timeoutMs: searchTimeoutMs,
+          signal,
+          requestId,
+          fallback: timeoutMs => serper(query, "news", timeoutMs, signal, requestId)
+        })
+      : await serper(query, kind, searchTimeoutMs, signal, requestId);
 
     let answer = null;
 
