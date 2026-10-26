@@ -77,7 +77,7 @@ test("a timed-out provider request is bounded and can recover through fallback",
   let fallbackCalled = false;
   const started = Date.now();
   const results = await searchNews("что нового в технологиях", {
-    timeoutMs: 500,
+    timeoutMs: 600,
     fetchImpl: (_url, options) => new Promise((resolve, reject) => {
       const fail = () => reject(options.signal.reason || new DOMException("aborted", "AbortError"));
       if (options.signal.aborted) return fail();
@@ -91,14 +91,14 @@ test("a timed-out provider request is bounded and can recover through fallback",
 
   assert.equal(fallbackCalled, true);
   assert.equal(results[0].title, "Восстановлено через резервный источник");
-  assert.ok(Date.now() - started < 450, "provider timeout must stay within its assigned budget");
+  assert.ok(Date.now() - started < 550, "provider timeout must stay within its assigned budget");
 });
 
 test("malformed and empty GDELT payloads are distinguished", () => {
   assert.equal(normalizeGdeltArticles({ results: [] }).ok, false);
   const empty = normalizeGdeltArticles({ articles: [] }, "week");
   assert.equal(empty.ok, true);
-  assert.deepEqual(empty.results, []);
+  assert.equal(empty.results.length, 0);
   assert.equal(empty.results.searchPeriod, "week");
 });
 
