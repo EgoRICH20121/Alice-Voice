@@ -570,8 +570,8 @@ test("5e. rain adds an umbrella hint and negative temperatures are formatted", (
 
 const NEWS = {
   news: [
-    { title: "Запущена новая ракета", date: "2 часа назад", snippet: "Ракета стартовала с космодрома и вывела на орбиту три спутника связи.", source: "РИА" },
-    { title: "Открыт новый мост", date: "5 часов назад", snippet: "Мост через реку соединил два района города и сократит время в пути.", source: "ТАСС" }
+    { title: "Запущена новая ракета", link: "https://example.com/rocket", date: "2 часа назад", snippet: "Ракета стартовала с космодрома и вывела на орбиту три спутника связи.", source: "РИА" },
+    { title: "Открыт новый мост", link: "https://example.com/bridge", date: "5 часов назад", snippet: "Мост через реку соединил два района города и сократит время в пути.", source: "ТАСС" }
   ]
 };
 
@@ -623,7 +623,7 @@ test("6c. if Gemini is down the news fall back to headlines with snippets and da
 
 test("6d. empty daily news trigger a bounded weekly fallback and label the period", async () => {
   const r = router({
-    serper: async body => body.tbs === "qdr:d" ? json({ news: [] }) : json({ news: [{ title: "Новый стандарт памяти", date: "3 дня назад", snippet: "Производители представили новый стандарт оперативной памяти.", source: "Техно" }] }),
+    serper: async body => body.tbs === "qdr:d" ? json({ news: [] }) : json({ news: [{ title: "Новый стандарт памяти", link: "https://example.com/ram-standard", date: "3 дня назад", snippet: "Производители представили новый стандарт оперативной памяти.", source: "Техно" }] }),
     gemini: async () => geminiOk("За последнюю неделю появился новый стандарт оперативной памяти.")
   });
   const f = mockFetch(r.impl);
