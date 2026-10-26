@@ -1349,7 +1349,7 @@ async function processTurn(body, history, remaining, signal, requestId) {
           timeoutMs: searchTimeoutMs,
           signal,
           requestId,
-          fallback: timeoutMs => serper(query, "news", timeoutMs, signal, requestId)
+          fallback: (timeoutMs, serperQuery, providerSignal) => serper(serperQuery || query, "news", timeoutMs, providerSignal || signal, requestId)
         })
       : await serper(query, kind, searchTimeoutMs, signal, requestId);
 
