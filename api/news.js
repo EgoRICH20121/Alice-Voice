@@ -58,7 +58,7 @@ function formatDate(raw) {
   const value = String(raw ?? "").trim();
   const m = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/);
   if (!m) return clean(value, 60);
-  return \`\${m[3]}.\${m[2]}.\${m[1]} \${m[4]}:\${m[5]} UTC\`;
+  return m[3] + "." + m[2] + "." + m[1] + " " + m[4] + ":" + m[5] + " UTC";
 }
 
 export function normalizeGdeltArticles(data, period = "day") {
