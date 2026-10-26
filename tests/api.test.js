@@ -715,6 +715,21 @@ test("12b. Serper HTTP error and empty results are distinguished", async () => {
   } finally { f.mock.restore(); }
 });
 
+test("news search with missing SERPER_API_KEY returns unavailable, not an empty-news answer", async () => {
+  const saved = process.env.SERPER_API_KEY;
+  delete process.env.SERPER_API_KEY;
+  const f = mockFetch(NO_CALLS);
+  try {
+    const { payload } = await call(turn("последние новости про озу"));
+    assert.match(payload.response.text, /Поиск сейчас недоступен/);
+    assert.doesNotMatch(payload.response.text, /не нашла/i);
+    assert.equal(f.mock.callCount(), 0);
+  } finally {
+    process.env.SERPER_API_KEY = saved;
+    f.mock.restore();
+  }
+});
+
 test("12c. missing SERPER_API_KEY does not crash", async () => {
   const saved = process.env.SERPER_API_KEY;
   delete process.env.SERPER_API_KEY;
