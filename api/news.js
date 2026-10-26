@@ -16,7 +16,8 @@ export function buildGdeltQuery(query) {
     .replace(/[«»„“”]/g, '"')
     .replace(/(?:самые\s+)?последние\s+новости/giu, " ")
     .replace(/новости/giu, " ")
-    .replace(/(?:расскажи|скажи|найди|поищи|что нового|про|о|об|по теме)/giu, " ")
+    .replace(/(?:расскажи|скажи|найди|поищи|что нового|по теме)/giu, " ")
+    .replace(/(?<![\p{L}])(?:про|о|об)(?![\p{L}])/giu, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
 
@@ -175,7 +176,7 @@ export async function searchNews(query, {
     }
   }
 
-  if (typeof fallback === "function" && remaining() >= MIN_FALLBACK_MS) {
+  if (typeof fallback === "function" && remaining() >= MIN_FALLBACK_MS - 75) {
     const fallbackBudget = Math.max(0, Math.min(800, remaining()));
     console.log("News provider fallback:", {
       requestId, from: "gdelt", to: "serper",
