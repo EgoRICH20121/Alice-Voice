@@ -1,6 +1,6 @@
 const GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc";
-const REQUEST_TIMEOUT_MS = 950;
-const MIN_FALLBACK_MS = 350;
+const REQUEST_TIMEOUT_MS = 1000;
+const MIN_FALLBACK_MS = 200;
 
 function clean(value, max = 300) {
   return String(value ?? "")
@@ -159,8 +159,8 @@ export async function searchNews(query, {
 
   // Prefer the existing Serper integration. Reserve enough time for GDELT
   // rather than letting the first provider consume the whole Alice deadline.
-  if (typeof fallback === "function" && remaining() >= 650) {
-    const primaryBudget = Math.min(1300, remaining() - MIN_FALLBACK_MS);
+  if (typeof fallback === "function" && remaining() >= 1200) {
+    const primaryBudget = Math.min(750, remaining() - 1000);
     if (primaryBudget >= 300) {
       try {
         const results = await fallback(primaryBudget);
